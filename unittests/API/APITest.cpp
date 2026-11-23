@@ -4614,6 +4614,49 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
   }
 }
 
+// getValueAtIndex reads dense JSArray elements directly. Holes, inherited
+// elements, accessors and out-of-bounds indices must behave as before.
+TEST_P(HermesRuntimeTest, GetValueAtIndexMatchesJS) {
+  eval(R"(
+    var at = (a, i) => a[i];
+    var arrays = [
+      [1, 'two', {three: 3}, undefined, null],
+      [1.5, 1e300, 2 ** 31, -0, 10n, Symbol('s'), true, -(2 ** 53)],
+      [1, , 3],
+      Object.defineProperty([1, 2, 3], 1, {get() { return 'getter'; }}),
+      Object.defineProperty([1, 2, 3], 2,
+          {value: 'ro', writable: false, enumerable: true}),
+      (function() { var a = []; a[5] = 'sparse'; return a; })(),
+      new Proxy([7, 8, 9], {get(t, k) { return k === '1' ? 'trap' : t[k]; }}),
+      Object.freeze([1, 'frozen', 3]),
+      Object.seal([1, , 'sealed']),
+    ];
+  )");
+  Function at = rt->global().getPropertyAsFunction(*rt, "at");
+  Array arrays = rt->global().getPropertyAsObject(*rt, "arrays").asArray(*rt);
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1)
+      eval("Array.prototype[1] = 'fromProto';");
+    for (size_t a = 0; a < arrays.size(*rt); ++a) {
+      Array arr = arrays.getValueAtIndex(*rt, a).getObject(*rt).asArray(*rt);
+      size_t n = arr.size(*rt);
+      for (size_t i = 0; i < n; ++i) {
+        Value got = arr.getValueAtIndex(*rt, i);
+        Value want = at.call(*rt, arr, (double)i);
+        EXPECT_TRUE(Value::strictEquals(*rt, got, want))
+            << "array " << a << " index " << i << " pass " << pass;
+      }
+      EXPECT_THROW(arr.getValueAtIndex(*rt, n), JSIException);
+      // An index that does not fit in 32 bits must not wrap to a valid one.
+      if (sizeof(size_t) > 4 && n > 0)
+        EXPECT_THROW(
+            arr.getValueAtIndex(*rt, static_cast<size_t>(UINT32_MAX) + 1),
+            JSIException);
+    }
+  }
+  eval("delete Array.prototype[1];");
+}
+
 INSTANTIATE_TEST_CASE_P(
     Runtimes,
     HermesRuntimeTest,

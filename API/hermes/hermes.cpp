@@ -3222,6 +3222,20 @@ bool HermesRuntimeImpl::detached(const jsi::ArrayBuffer &arr) {
 
 jsi::Value HermesRuntimeImpl::getValueAtIndex(const jsi::Array &arr, size_t i) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  if (LLVM_LIKELY(vm::vmisa<vm::JSArray>(phv(arr)))) {
+    auto *array = vm::vmcast<vm::JSArray>(phv(arr));
+    // A non-empty storage slot is an own data element (accessors, and
+    // elements moved to named storage, leave their slot empty). Its value is
+    // what [[Get]] returns whatever its attributes, so frozen and sealed
+    // arrays are fine too. Empty slots take the generic path, which looks at
+    // the prototype chain and reports out-of-bounds indices.
+    if (LLVM_LIKELY(i < array->getEndIndex())) {
+      vm::SmallHermesValue element =
+          array->at(runtime_, static_cast<uint32_t>(i));
+      if (LLVM_LIKELY(!element.isEmpty()))
+        return valueFromHermesValue(element.unboxToHV(runtime_));
+    }
+  }
   vm::GCScope gcScope(runtime_);
   if (LLVM_UNLIKELY(i >= size(arr))) {
     throwJSErrorWithMessage(
