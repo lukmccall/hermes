@@ -96,18 +96,73 @@ static std::pair<char32_t, size_t> convertToCodePointAt(
   }
 }
 
+/// \return the number of bytes convertUTF16ToUTF8WithReplacements produces
+/// for \p input: 1, 2 or 3 per code unit, 4 per surrogate pair, and 3 for an
+/// unpaired surrogate (replaced by U+FFFD).
+static size_t utf8LengthWithReplacements(llvh::ArrayRef<char16_t> input) {
+  size_t len = 0;
+  const char16_t *cur = input.begin(), *end = input.end();
+  while (cur < end) {
+    char16_t c = *cur++;
+    if (c <= 0x7F) {
+      len += 1;
+    } else if (c <= 0x7FF) {
+      len += 2;
+    } else if (isHighSurrogate(c) && cur < end && isLowSurrogate(*cur)) {
+      len += 4;
+      ++cur;
+    } else {
+      len += 3;
+    }
+  }
+  return len;
+}
+
 bool convertUTF16ToUTF8WithReplacements(
     std::string &out,
     llvh::ArrayRef<char16_t> input,
     size_t maxCharacters) {
+  if (!maxCharacters) {
+    // Unbounded: write the bytes directly into a buffer instead of growing
+    // the string with an out-of-line insert per non-ASCII code point. Short
+    // inputs use a stack buffer sized for the worst case (3 bytes per UTF-16
+    // code unit; a surrogate pair is 2 units and 4 bytes); longer ones count
+    // the exact length first and size the string once, so the result holds no
+    // slack.
+    constexpr size_t kStackUnits = 128;
+    char stackBuf[kStackUnits * 3];
+    const bool useStackBuf = input.size() <= kStackUnits;
+    if (!useStackBuf)
+      out.resize(utf8LengthWithReplacements(input));
+    char *const base = useStackBuf ? stackBuf : &out[0];
+    char *dst = base;
+    const char16_t *cur = input.begin(), *end = input.end();
+    while (cur < end) {
+      // A run of ASCII: a narrowing copy the compiler can vectorize.
+      const char16_t *run = cur;
+      while (run < end && *run <= 0x7F)
+        ++run;
+      for (; cur < run; ++cur)
+        *dst++ = static_cast<char>(*cur);
+      if (cur == end)
+        break;
+      auto [c32, inputConsumed] = convertToCodePointAt(cur, end);
+      cur += inputConsumed;
+      encodeUTF8(dst, c32);
+    }
+    if (useStackBuf) {
+      out.assign(base, dst - base);
+    } else {
+      assert(
+          (size_t)(dst - base) == out.size() &&
+          "utf8LengthWithReplacements disagrees with the encoder");
+    }
+    return true;
+  }
   out.clear();
   out.reserve(input.size());
   // Stop early if we've reached currNumCharacters worth of UTF-8 characters.
   size_t currNumCharacters = 0;
-  if (!maxCharacters) {
-    // Condition checks are easier if this number is set to the max value.
-    maxCharacters = std::numeric_limits<size_t>::max();
-  }
   auto cur = input.begin(), end = input.end();
   for (; cur < end && currNumCharacters < maxCharacters;
        ++cur, ++currNumCharacters) {

@@ -10,6 +10,7 @@
 
 #include "gtest/gtest.h"
 
+#include <string>
 #include <vector>
 
 using namespace hermes;
@@ -111,6 +112,93 @@ TEST(StringTest, UTF16ToUTF8StringWithReplacements) {
   strAndFullyWritten = convertWithMaxChars({'a', 'b', 'c'}, 3);
   EXPECT_EQ(bytes({'a', 'b', 'c'}), strAndFullyWritten.first);
   EXPECT_EQ(true, strAndFullyWritten.second);
+}
+
+// Without a character limit, convertUTF16ToUTF8WithReplacements writes into a
+// preallocated buffer. Its output must match the bounded path's exactly.
+TEST(StringTest, UTF16ToUTF8UnboundedMatchesBounded) {
+  const char16_t units[] = {
+      u'a', u'Z', 0x7F, 0x80, 0xFF, 0x100, 0x7FF, 0x800, 0xFFFF,
+      0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xD83D, 0xDE00, 0x017C};
+  const size_t numUnits = sizeof(units) / sizeof(units[0]);
+  uint32_t seed = 12345;
+  auto next = [&seed]() {
+    seed = seed * 1103515245 + 12345;
+    return (seed >> 16) & 0x7FFF;
+  };
+  // Lengths around the short/long buffer boundary and beyond.
+  for (size_t len : {0, 1, 2, 3, 7, 64, 127, 128, 129, 200, 1000}) {
+    for (int trial = 0; trial < 50; ++trial) {
+      std::u16string s(len, u'x');
+      for (auto &c : s) {
+        uint32_t r = next() % 4;
+        c = r == 0 ? u'x' : units[next() % numUnits];
+      }
+      llvh::ArrayRef<char16_t> input(s.data(), s.size());
+      std::string unbounded, bounded;
+      EXPECT_TRUE(convertUTF16ToUTF8WithReplacements(unbounded, input));
+      // A limit above the number of characters takes the bounded path.
+      EXPECT_TRUE(convertUTF16ToUTF8WithReplacements(bounded, input, len + 1));
+      EXPECT_EQ(unbounded, bounded) << "length " << len << " trial " << trial;
+    }
+  }
+}
+
+// Literal expectations for inputs past the stack buffer (the counted, heap
+// path), so it is not only checked against the bounded path.
+TEST(StringTest, UTF16ToUTF8UnboundedLongLiterals) {
+  // 130 surrogate pairs (260 code units): U+1F639 is F0 9F 98 B9.
+  std::u16string pairs;
+  std::string pairsUTF8;
+  for (int i = 0; i < 130; ++i) {
+    pairs += u"\U0001F639";
+    pairsUTF8 += "\xF0\x9F\x98\xB9";
+  }
+  std::string out;
+  EXPECT_TRUE(convertUTF16ToUTF8WithReplacements(
+      out, llvh::ArrayRef<char16_t>(pairs.data(), pairs.size())));
+  EXPECT_EQ(out, pairsUTF8);
+
+  // 200 ASCII units, a 2-byte unit, then a lone high surrogate at the end,
+  // which becomes U+FFFD (EF BF BD).
+  std::u16string tail(200, u'x');
+  tail += u'\u00E9';
+  tail += (char16_t)0xD83D;
+  std::string tailUTF8 = std::string(200, 'x') + "\xC3\xA9\xEF\xBF\xBD";
+  out = "previous contents";
+  EXPECT_TRUE(convertUTF16ToUTF8WithReplacements(
+      out, llvh::ArrayRef<char16_t>(tail.data(), tail.size())));
+  EXPECT_EQ(out, tailUTF8);
+}
+
+// Fixed cases for the unbounded path: long ASCII runs (with NULs), inputs
+// that need the full 3 bytes per code unit, unpaired surrogates, either side
+// of the stack-buffer limit, and a destination that already holds data.
+TEST(StringTest, UTF16ToUTF8UnboundedFixedCases) {
+  auto bounded = [](const std::u16string &s) {
+    std::string out;
+    convertUTF16ToUTF8WithReplacements(
+        out, llvh::ArrayRef<char16_t>(s.data(), s.size()), s.size() + 1);
+    return out;
+  };
+  for (size_t len : {0, 1, 127, 128, 129, 400}) {
+    std::u16string ascii(len, u'q'), threeByte(len, 0x20AC),
+        lone(len, 0xD800), withNul(len, u'a');
+    for (size_t i = 0; i < len; i += 7)
+      withNul[i] = 0;
+    for (const std::u16string &s : {ascii, threeByte, lone, withNul}) {
+      // A destination with previous contents must be replaced, not appended.
+      std::string out = "previous contents";
+      EXPECT_TRUE(convertUTF16ToUTF8WithReplacements(
+          out, llvh::ArrayRef<char16_t>(s.data(), s.size())));
+      EXPECT_EQ(out, bounded(s)) << "length " << len;
+    }
+    // All three-byte units: exactly 3 bytes each.
+    std::string out;
+    convertUTF16ToUTF8WithReplacements(
+        out, llvh::ArrayRef<char16_t>(threeByte.data(), threeByte.size()));
+    EXPECT_EQ(out.size(), 3 * len);
+  }
 }
 
 TEST(StringTest, IsAllASCIITest) {
