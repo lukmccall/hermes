@@ -293,12 +293,23 @@ class GCScope : public GCScopeDebugBase {
 #ifdef HERMESVM_DEBUG_TRACK_GCSCOPE_HANDLES
         name_(name),
 #endif
-        prevScope_(runtime.topGCScope_),
-        chunks_({(PinnedHermesValue *)inlineStorage_}) {
+        prevScope_(runtime.topGCScope_) {
+    // push_back is inline, unlike the initializer_list constructor.
+    chunks_.push_back((PinnedHermesValue *)inlineStorage_);
     runtime.topGCScope_ = this;
   }
 
-  ~GCScope();
+  /// Most scopes never allocate a second chunk; for them, popping the scope
+  /// is all there is to do, inline. The rest is out of line.
+  ~GCScope() {
+    runtime_.topGCScope_ = prevScope_;
+#if !defined(HERMES_SLOW_DEBUG) && \
+    !defined(HERMESVM_DEBUG_TRACK_GCSCOPE_HANDLES)
+    if (LLVM_LIKELY(chunks_.size() == 1))
+      return;
+#endif
+    destroySlow();
+  }
 
   /// \return the parent scope of this scope.
   GCScope *getParentScope() {
@@ -460,6 +471,11 @@ class GCScope : public GCScopeDebugBase {
   /// The current chunk is full, so allocate a new chunk and allocate a
   /// PinnedHermesValue inside it. This is the allocation slow path.
   PinnedHermesValue *_newChunkAndPHV(HermesValue value);
+
+  /// Free the chunks allocated beyond the inline one and, in debug builds,
+  /// invalidate the handles and record the scope's handle count. Called by
+  /// ~GCScope when it has more to do than pop the scope.
+  void destroySlow();
 
   /// Mark all handles in this scope.
   void mark(RootAcceptor &acceptor);

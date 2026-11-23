@@ -25,9 +25,8 @@ void HandleRootOwner::markGCScopes(RootAcceptor &acceptor) {
 //===----------------------------------------------------------------------===//
 // class GCScope
 
-GCScope::~GCScope() {
-  // Pop ourselves from the scope list.
-  runtime_.topGCScope_ = prevScope_;
+void GCScope::destroySlow() {
+  // (~GCScope already popped this scope from the scope list.)
 
   // Free the dynamically allocated chunks, which are all chunks except the
   // first one.

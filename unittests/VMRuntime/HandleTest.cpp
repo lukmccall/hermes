@@ -156,6 +156,107 @@ TEST_F(HandleTest, ScopedPointerConstructorTest) {
   ASSERT_EQ(function.get(), obj.get());
 }
 
+/// Leave nested scopes holding 0, 1, 16 (one full chunk) and 17+ (several
+/// chunks) handles, and a multi-chunk scope cleared before it is left. After
+/// each, the parent must be the top scope again and its handles must still be
+/// roots across a collection. In builds without HERMES_SLOW_DEBUG the
+/// single-chunk exits take the inline path in ~GCScope.
+TEST_F(HandleTest, NestedScopeExitTest) {
+  GCScope &outer = gcScope;
+  // Above the default debug limit, so scopes can grow several chunks.
+  constexpr unsigned kLimit = 256;
+  // \return whether a new handle is allocated in \p scope, i.e. whether it
+  // is the top scope. The probe handle is released again, so the scope's
+  // handle count is unchanged (but a probe at a chunk boundary leaves a new
+  // chunk allocated).
+  auto isTop = [&](GCScope &scope) {
+    GCScopeMarkerRAII marker(scope);
+    size_t before = scope.getHandleCountDbg();
+    runtime.makeHandle(HermesValue::encodeTrustedNumberValue(0));
+    return scope.getHandleCountDbg() == before + 1;
+  };
+
+  // Strings of distinct lengths, so a stale or overwritten root shows up.
+  std::vector<Handle<StringPrimitive>> parents;
+  for (unsigned i = 0; i < 4; ++i)
+    parents.push_back(
+        StringPrimitive::createNoThrow(runtime, std::string(i + 1, 'p')));
+  // The helpers return false on a mismatch, so callers can ASSERT on them
+  // (an ASSERT inside a lambda would only return from the lambda).
+  auto checkParents = [&]() {
+    runtime.collect("test");
+    for (unsigned i = 0; i < parents.size(); ++i) {
+      if (parents[i]->getStringLength() != i + 1 || parents[i]->at(0) != u'p')
+        return false;
+    }
+    return true;
+  };
+
+  auto fillScope = [&](unsigned count) {
+    std::vector<Handle<StringPrimitive>> handles;
+    for (unsigned i = 0; i < count; ++i)
+      handles.push_back(
+          StringPrimitive::createNoThrow(runtime, std::string(i + 1, 'c')));
+    runtime.collect("test");
+    for (unsigned i = 0; i < count; ++i) {
+      if (handles[i]->getStringLength() != i + 1)
+        return false;
+    }
+    return true;
+  };
+
+  for (unsigned count :
+       {0u,
+        1u,
+        (unsigned)GCScope::getChunkSize(),
+        (unsigned)GCScope::getChunkSize() + 1,
+        (unsigned)GCScope::getChunkSize() * 3 + 5}) {
+    {
+      GCScope child(runtime, "child", kLimit);
+      ASSERT_TRUE(isTop(child));
+      ASSERT_TRUE(fillScope(count));
+      {
+        GCScope grandchild(runtime, "grandchild", kLimit);
+        ASSERT_TRUE(isTop(grandchild));
+        ASSERT_TRUE(fillScope(count));
+        // Leave it with exactly `count` handles: 0, 1 and 16 fit the inline
+        // chunk (the inline exit), 17 and 53 need more chunks.
+        ASSERT_EQ(count, grandchild.getHandleCountDbg());
+      }
+      // A probe of a full inline chunk would allocate a second chunk and turn
+      // the child's exit into a multi-chunk one; the grandchild covers 16.
+      if (count != GCScope::getChunkSize())
+        ASSERT_TRUE(isTop(child));
+      ASSERT_EQ(count, child.getHandleCountDbg());
+    }
+    ASSERT_TRUE(isTop(outer));
+    ASSERT_TRUE(checkParents());
+  }
+
+  // A scope that grew several chunks and was then cleared still owns those
+  // chunks when it is left.
+  {
+    GCScope child(runtime, "child", kLimit);
+    ASSERT_TRUE(fillScope(GCScope::getChunkSize() * 2 + 3));
+    child.clearAllHandles();
+    ASSERT_TRUE(fillScope(2));
+  }
+  ASSERT_TRUE(isTop(outer));
+  ASSERT_TRUE(checkParents());
+  {
+    GCScope child(runtime, "child", kLimit);
+    ASSERT_TRUE(fillScope(GCScope::getChunkSize() * 2 + 3));
+    child.flushToSmallCount(0);
+    ASSERT_TRUE(fillScope(GCScope::getChunkSize() + 1));
+  }
+  ASSERT_TRUE(isTop(outer));
+  ASSERT_TRUE(checkParents());
+
+  // The parent scope keeps working after its children are gone.
+  parents.push_back(StringPrimitive::createNoThrow(runtime, "ppppp"));
+  ASSERT_TRUE(checkParents());
+}
+
 TEST_F(HandleTest, PinnedValueHV32Test) {
   struct : Locals {
     PinnedValue<DummyObject> obj;
