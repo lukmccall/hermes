@@ -54,6 +54,7 @@
 #include "extensions/ExtensionsBytecode.h"
 #endif
 
+#include "llvh/ADT/DenseSet.h"
 #include "llvh/Support/ConvertUTF.h"
 #include "llvh/Support/ErrorHandling.h"
 #include "llvh/Support/FileSystem.h"
@@ -68,6 +69,7 @@
 #include <system_error>
 #include <unordered_map>
 
+#include <hermes/ObjectShapes.h>
 #include <jsi/instrumentation.h>
 #include <jsi/threadsafe.h>
 
@@ -299,7 +301,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
                                 private IHermesTestHelpers,
                                 private InstallHermesFatalErrorHandler,
                                 private jsi::Instrumentation,
-                                public ISetEventLoopControl
+                                public ISetEventLoopControl,
+                                public IHermesObjectShapes
 #ifdef JSI_UNSTABLE
     ,
                                 public jsi::ISerialization,
@@ -359,6 +362,17 @@ class HermesRuntimeImpl final : public HermesRuntime,
             // the iteration will not destroy the WeakRoot.
             acceptor.acceptWeak(element.valueUnsafe());
           });
+          // Custom weak roots are visited by every collection, young-gen ones
+          // included, although hidden classes are long-lived (the VM's own
+          // property caches skip theirs in a young-gen collection that does
+          // not compact). The walk takes the lock and is short for the few
+          // shapes (about one per record type) an integration creates.
+          std::lock_guard<std::mutex> lock(objectShapes_.mutex);
+          for (HermesObjectShape *shape : objectShapes_.shapes) {
+            for (ReadCacheEntry &entry : shape->read)
+              acceptor.acceptWeak(entry.clazz);
+            acceptor.acceptWeak(shape->createClazz);
+          }
         });
 #ifdef HERMES_MEMORY_INSTRUMENTATION
     runtime_.addCustomSnapshotFunction(
@@ -1413,6 +1427,20 @@ class HermesRuntimeImpl final : public HermesRuntime,
       UUIDInfo>
       dataMap_;
 
+  struct HermesObjectShape;
+  /// The live IObjectShapes of this runtime, whose cached classes are weak
+  /// roots. A shape is held by shared_ptr and may be released on any thread,
+  /// hence the lock. Declared before finalizerExecutor_ so that it outlives
+  /// the tasks the executor runs while it is destroyed: a shape held by a host
+  /// object, host function or native state is released by one of them.
+  struct ObjectShapeRegistry {
+    std::mutex mutex;
+    llvh::DenseSet<HermesObjectShape *> shapes;
+    ~ObjectShapeRegistry() {
+      assert(shapes.empty() && "an IObjectShape outlived its runtime");
+    }
+  } objectShapes_;
+
   /// Executor used to finalize NativeState, HostFunction, and HostObjects on
   /// a background thread so that GC collection is not blocked by potentially
   /// expensive clean-up work. The destructor explicitly calls rt_.reset()
@@ -1472,6 +1500,274 @@ class HermesRuntimeImpl final : public HermesRuntime,
 
   /// ExecutionScope for this Runtime.
   MutatorScope mutatorScope;
+
+  // ---- IHermesObjectShapes ------------------------------------------------
+
+  /// What getShapedProperties remembers about a class it read an object of:
+  /// either the slot of every name of the shape, or (generic) that the names
+  /// cannot all be read from slots (one is missing, inherited or an accessor,
+  /// or the object is exotic), so that objects of the class are read one
+  /// property at a time without probing the class again. Slots stay valid
+  /// while the object has the class: a class is never cached as slots if it
+  /// is a no-cache dictionary, and a cacheable dictionary changes in place
+  /// only by gaining properties in slots no cached name uses (a delete or an
+  /// attribute change gives the object another class). Generic is correct for
+  /// any object.
+  struct ReadCacheEntry {
+    vm::WeakRoot<vm::HiddenClass> clazz{nullptr};
+    bool generic{false};
+    std::vector<vm::SlotIndex> slots;
+  };
+
+  /// A shape: its names, kept alive as PropNameIDs, a read cache of two
+  /// entries (so that a list alternating between two classes, for example
+  /// records with and without an optional field, does not refill it on every
+  /// element), and the class createObjectFromShape gives new objects (whose
+  /// properties are the names, in order, in slots 0..n-1). Classes are held
+  /// as weak roots.
+  struct HermesObjectShape final : public IObjectShape {
+    HermesRuntimeImpl &rt;
+    std::vector<jsi::PropNameID> names;
+    std::vector<vm::SymbolID> syms;
+    ReadCacheEntry read[2];
+    /// The read cache entry to replace on a miss: the one not used last.
+    unsigned readVictim{0};
+    vm::WeakRoot<vm::HiddenClass> createClazz{nullptr};
+
+    explicit HermesObjectShape(HermesRuntimeImpl &rt) : rt(rt) {}
+    ~HermesObjectShape() override {
+      std::lock_guard<std::mutex> lock(rt.objectShapes_.mutex);
+      rt.objectShapes_.shapes.erase(this);
+    }
+    size_t size() const override {
+      return syms.size();
+    }
+  };
+
+  HermesObjectShape &toHermesObjectShape(const IObjectShape &shapeBase) {
+    auto &shape = const_cast<HermesObjectShape &>(
+        static_cast<const HermesObjectShape &>(shapeBase));
+    assert(&shape.rt == this && "IObjectShape used with another runtime");
+    return shape;
+  }
+
+  std::shared_ptr<IObjectShape> createObjectShape(
+      const jsi::PropNameID *names,
+      size_t count) override {
+    if (count > vm::HiddenClass::kDictionaryThreshold)
+      return nullptr;
+    auto shape = std::make_shared<HermesObjectShape>(*this);
+    for (size_t i = 0; i < count; ++i) {
+      vm::SymbolID sym = phv(names[i]).getSymbol();
+      if (std::find(shape->syms.begin(), shape->syms.end(), sym) !=
+          shape->syms.end())
+        return nullptr;
+      shape->syms.push_back(sym);
+      shape->names.emplace_back(*this, names[i]);
+    }
+    for (ReadCacheEntry &entry : shape->read)
+      entry.slots.resize(count);
+    std::lock_guard<std::mutex> lock(objectShapes_.mutex);
+    objectShapes_.shapes.insert(shape.get());
+    return shape;
+  }
+
+  /// Construct out[i] from slots[i] of \p self, for i in [0, n).
+  /// valueFromHermesValue does not allocate on the JS heap, so \p self stays
+  /// valid throughout.
+  LLVM_ATTRIBUTE_ALWAYS_INLINE void readNamedSlots(
+      vm::JSObject *self,
+      const vm::SlotIndex *slots,
+      size_t n,
+      jsi::Value *out) {
+    for (size_t i = 0; i < n; ++i) {
+      assert(out[i].isUndefined() && "out must hold undefined values");
+      new (&out[i]) jsi::Value(valueFromHermesValue(
+          vm::JSObject::getNamedSlotValueUnsafe(self, runtime_, slots[i])
+              .unboxToHV(runtime_)));
+    }
+  }
+
+  /// Read the names of \p shape from \p obj one at a time, as
+  /// getProperty(obj, PropNameID) does: getters run, missing properties are
+  /// undefined, exotic objects behave as such.
+  void getShapedPropertiesGeneric(
+      const jsi::Object &obj,
+      const HermesObjectShape &shape,
+      jsi::Value *out) {
+    vm::GCScope gcScope(runtime_);
+    auto h = handle(obj);
+    for (size_t i = 0, n = shape.syms.size(); i < n; ++i) {
+      vm::GCScopeMarkerRAII marker(runtime_);
+      auto res = h->getNamedOrIndexed(h, runtime_, shape.syms[i]);
+      checkStatus(res.getStatus());
+      assert(out[i].isUndefined() && "out must hold undefined values");
+      new (&out[i]) jsi::Value(valueFromHermesValue(res->get()));
+    }
+  }
+
+  void getShapedProperties(
+      const jsi::Object &obj,
+      const IObjectShape &shapeBase,
+      jsi::Value *out) override {
+    ExecutionScopeRAII scopeRAII(mutatorScope);
+    HermesObjectShape &shape = toHermesObjectShape(shapeBase);
+    const size_t n = shape.syms.size();
+    // Nothing below allocates on the JS heap before the generic path, which
+    // does not use `self`.
+    auto *self = vm::vmcast<vm::JSObject>(phv(obj));
+    vm::CompressedPointer clazzPtr{self->getClassGCPtr()};
+    for (unsigned e = 0; e < 2; ++e) {
+      ReadCacheEntry &entry = shape.read[e];
+      if (entry.clazz != clazzPtr)
+        continue;
+      shape.readVictim = e ^ 1;
+      if (LLVM_UNLIKELY(entry.generic))
+        getShapedPropertiesGeneric(obj, shape, out);
+      else
+        readNamedSlots(self, entry.slots.data(), n, out);
+      return;
+    }
+    // A miss: probe the class and remember the result in the entry not used
+    // last. The rule is the interpreter's for caching a property read: an
+    // own data property found without allocating, in a class that is not a
+    // no-cache dictionary (host, proxy, lazy and indexed-storage objects are
+    // class flags too).
+    const unsigned victim = shape.readVictim;
+    shape.readVictim = victim ^ 1;
+    ReadCacheEntry &entry = shape.read[victim];
+    entry.clazz = vm::CompressedPointer(nullptr);
+    vm::HiddenClass *clazz = self->getClass(runtime_);
+    bool generic = clazz->hasIndexedStorage() || clazz->isHostObject() ||
+        clazz->isProxyObject() || clazz->isLazyObject() ||
+        clazz->isDictionaryNoCache();
+    for (size_t i = 0; !generic && i < n; ++i) {
+      vm::NamedPropertyDescriptor desc;
+      ::hermes::OptValue<bool> found =
+          vm::JSObject::tryGetOwnNamedDescriptorFast(
+              self, runtime_, shape.syms[i], desc);
+      if (!found.hasValue()) {
+        // The class lent its property map to a child class. Don't remember
+        // anything: the generic path rebuilds the map, so that the next call
+        // can cache the class.
+        getShapedPropertiesGeneric(obj, shape, out);
+        return;
+      }
+      if (found.getValue() && !desc.flags.accessor && !desc.flags.hostObject &&
+          !desc.flags.proxyObject)
+        entry.slots[i] = desc.slot;
+      else
+        generic = true;
+    }
+    entry.clazz = clazzPtr;
+    entry.generic = generic;
+    if (generic)
+      getShapedPropertiesGeneric(obj, shape, out);
+    else
+      readNamedSlots(self, entry.slots.data(), n, out);
+  }
+
+  jsi::Object createObjectFromShape(
+      const IObjectShape &shapeBase,
+      const jsi::Value *values) override {
+    ExecutionScopeRAII scopeRAII(mutatorScope);
+    HermesObjectShape &shape = toHermesObjectShape(shapeBase);
+    const size_t n = shape.syms.size();
+    vm::GCScope gcScope(runtime_);
+    struct : public vm::Locals {
+      vm::PinnedValue<vm::HiddenClass> clazz;
+      vm::PinnedValue<vm::JSObject> obj;
+    } lv;
+    vm::LocalsRAII lraii(runtime_, &lv);
+    if (shape.createClazz) {
+      lv.clazz = shape.createClazz.getNonNull(runtime_, runtime_.getHeap());
+    } else {
+      // Define the names in order on a template object: its class is the one
+      // an object literal with these keys gets.
+      // Each step can allocate handles (a class transition takes at least
+      // one); release them per name so that a shape of up to
+      // kDictionaryThreshold names stays within the scope's handle limit.
+      lv.obj = vm::JSObject::create(runtime_).get();
+      for (size_t i = 0; i < n; ++i) {
+        vm::GCScopeMarkerRAII marker(runtime_);
+        checkStatus(vm::JSObject::defineNewOwnProperty(
+            lv.obj,
+            runtime_,
+            shape.syms[i],
+            vm::PropertyFlags::defaultNewNamedPropertyFlags(),
+            vm::Runtime::getUndefinedValue()));
+      }
+      lv.clazz = lv.obj->getClass(runtime_);
+      // At most kDictionaryThreshold distinct names, added in order to an
+      // empty object, take as many class transitions (only adding one more
+      // makes a dictionary), and each puts its name in the next slot. The
+      // class may already exist, with its property map lent to a child class,
+      // so check with the lookup that rebuilds the map.
+#ifndef NDEBUG
+      assert(
+          !lv.clazz->isDictionary() && lv.clazz->getNumProperties() == n &&
+          "template object of a shape has an unexpected class");
+      for (size_t i = 0; i < n; ++i) {
+        vm::GCScopeMarkerRAII marker(runtime_);
+        vm::NamedPropertyDescriptor desc;
+        bool found = vm::JSObject::getOwnNamedDescriptor(
+            lv.obj, runtime_, shape.syms[i], desc);
+        assert(found && desc.slot == i && "shape name not in its slot");
+        (void)found;
+      }
+#endif
+      shape.createClazz =
+          vm::CompressedPointer::encodeNonNull(*lv.clazz, runtime_);
+    }
+    lv.obj = vm::JSObject::create(
+                 runtime_,
+                 vm::Handle<vm::JSObject>::vmcast(&runtime_.objectPrototype),
+                 lv.clazz)
+                 .get();
+    for (size_t i = 0; i < n; ++i) {
+      // Encoding may allocate (HV32), so the object is re-read each time.
+      auto shv = vm::SmallHermesValue::encodeHermesValue(
+          hvFromValue(values[i]), runtime_);
+      vm::JSObject::setNamedSlotValueUnsafe(
+          *lv.obj, runtime_, static_cast<vm::SlotIndex>(i), shv);
+    }
+    return add<jsi::Object>(lv.obj.getHermesValue());
+  }
+
+  void getArrayElements(
+      const jsi::Array &arr,
+      size_t start,
+      size_t count,
+      jsi::Value *out) override {
+    ExecutionScopeRAII scopeRAII(mutatorScope);
+    size_t i = 0;
+    while (i < count) {
+      // Read in place while no JS can run: elements below the current length
+      // that are stored in the array. A hole (whose value may come from a
+      // getter on the prototype chain) or an index at or past the end is read
+      // with getValueAtIndex, so that getters run and bounds are checked
+      // exactly as in a loop of single reads; then direct reads resume, with
+      // the array and its length read again, since JS may have changed them.
+      if (LLVM_LIKELY(vm::vmisa<vm::JSArray>(phv(arr)))) {
+        auto *array = vm::vmcast<vm::JSArray>(phv(arr));
+        size_t len = vm::JSArray::getLength(array, runtime_);
+        for (; i < count && start < len && i < len - start; ++i) {
+          vm::SmallHermesValue element =
+              array->at(runtime_, static_cast<uint32_t>(start + i));
+          if (LLVM_UNLIKELY(element.isEmpty()))
+            break;
+          assert(out[i].isUndefined() && "out must hold undefined values");
+          new (&out[i])
+              jsi::Value(valueFromHermesValue(element.unboxToHV(runtime_)));
+        }
+      }
+      if (i == count)
+        break;
+      assert(out[i].isUndefined() && "out must hold undefined values");
+      new (&out[i]) jsi::Value(getValueAtIndex(arr, start + i));
+      ++i;
+    }
+  }
 };
 
 void HermesRuntimeImpl::maybeScheduleIdleGC() {
@@ -1736,6 +2032,8 @@ jsi::ICast *HermesRuntimeImpl::castInterface(const jsi::UUID &interfaceUUID) {
 #endif
   else if (interfaceUUID == ISetEventLoopControl::uuid) {
     return static_cast<ISetEventLoopControl *>(this);
+  } else if (interfaceUUID == IHermesObjectShapes::uuid) {
+    return static_cast<IHermesObjectShapes *>(this);
   }
   return nullptr;
 }

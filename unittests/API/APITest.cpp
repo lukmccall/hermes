@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <hermes/BCGen/HBC/BytecodeFileFormat.h>
 #include <hermes/CompileJS.h>
+#include <hermes/ObjectShapes.h>
 #include <hermes/Public/JSOutOfMemoryError.h>
 #include <hermes/VM/TimeLimitMonitor.h>
 #include <hermes/VM/VMExperiments.h>
@@ -4612,6 +4613,504 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
           caughtObj, rt->global().getPropertyAsFunction(*rt, "URIError")));
     }
   }
+}
+
+// IHermesObjectShapes: every bulk result must equal what JS computes.
+TEST(HermesObjectShapesTest, MatchesJS) {
+  auto rt = makeHermesRuntime();
+  auto *shapes = castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+  ASSERT_NE(shapes, nullptr);
+  auto eval = [&](const char *src) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(src), "");
+  };
+  eval(R"(
+    var log = [];
+    var get = (o, k) => o[k];
+    function literal(keys, values) {
+      var o = {};
+      keys.forEach((k, i) => Object.defineProperty(o, k,
+          {value: values[i], writable: true, enumerable: true, configurable: true}));
+      return o;
+    }
+    function dump(o) {
+      return Reflect.ownKeys(o).map(k => {
+        var d = Object.getOwnPropertyDescriptor(o, k);
+        return String(k) + '=' + (typeof d.value === 'object' && d.value ? 'obj' : String(d.value)) +
+            (d.writable ? 'W' : '') + (d.enumerable ? 'E' : '') + (d.configurable ? 'C' : '');
+      }).join(',') + (Object.getPrototypeOf(o) === Object.prototype ? '' : ' proto!');
+    }
+    function targets(r) {
+      var t = [{a: 1, b: 'two', c: 3.5}, {a: r, b: {}, c: undefined},
+               {c: 3, b: 2, a: 1}, {a: 1},
+               Object.create({a: 'inherited', c: 'inh'}),
+               Object.defineProperty({a: 1, b: 2, c: 3}, 'b', {get() { log.push('g'); return 'getter'; }}),
+               new Proxy({a: 1}, {get(t, k) { return 'trap:' + String(k); }}),
+               Object.freeze({a: 'frozen', b: 1, c: 2}), [10, 20, 30],
+               Object.create(null)];
+      // A class that exists before the shape uses it, with its property map
+      // lent to a child class.
+      var x = {a: 1, b: 2, c: 3}; x.d = 4;
+      t.push({a: 9, b: 8, c: 7});
+      var d = {a: 1, b: 2, c: 3, e: 0}; delete d.e; t.push(d);
+      return t;
+    }
+  )");
+  // Duplicates are refused.
+  {
+    std::vector<PropNameID> dup;
+    dup.push_back(PropNameID::forAscii(*rt, "a"));
+    dup.push_back(PropNameID::forAscii(*rt, "a"));
+    EXPECT_EQ(shapes->createObjectShape(dup.data(), dup.size()), nullptr);
+  }
+  const std::vector<std::vector<std::string>> keySets = {
+      {"a", "b", "c"},
+      {"c", "a"},
+      {"missing", "a"},
+      {"0", "length"},
+      {"__proto__", "a"},
+      {"f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"}};
+  Function targets = rt->global().getPropertyAsFunction(*rt, "targets");
+  Function get = rt->global().getPropertyAsFunction(*rt, "get");
+  Function literal = rt->global().getPropertyAsFunction(*rt, "literal");
+  Function dump = rt->global().getPropertyAsFunction(*rt, "dump");
+  {
+    std::vector<std::vector<PropNameID>> names(keySets.size());
+    std::vector<std::shared_ptr<facebook::hermes::IObjectShape>> shapeList;
+    for (size_t s = 0; s < keySets.size(); ++s) {
+      for (auto &k : keySets[s])
+        names[s].push_back(PropNameID::forUtf8(*rt, k));
+      shapeList.push_back(
+          shapes->createObjectShape(names[s].data(), names[s].size()));
+      ASSERT_NE(shapeList.back(), nullptr);
+      EXPECT_EQ(shapeList.back()->size(), keySets[s].size());
+    }
+    for (int round = 0; round < 8; ++round) {
+      if (round == 4) {
+        // Creation must not run setters (object literal semantics).
+        eval(
+            "Object.defineProperty(Object.prototype, 'a', "
+            "{set(v) { log.push('setter'); }, configurable: true});");
+      }
+      Array ts = targets.call(*rt, round).getObject(*rt).getArray(*rt);
+      for (int pass = 0; pass < 2; ++pass) {
+        for (size_t t = 0; t < ts.size(*rt); ++t) {
+          Object obj = ts.getValueAtIndex(*rt, t).getObject(*rt);
+          for (size_t s = 0; s < keySets.size(); ++s) {
+            std::vector<Value> got(keySets[s].size());
+            shapes->getShapedProperties(obj, *shapeList[s], got.data());
+            for (size_t i = 0; i < keySets[s].size(); ++i) {
+              Value want = get.call(
+                  *rt, obj, String::createFromUtf8(*rt, keySets[s][i]));
+              EXPECT_TRUE(Value::strictEquals(*rt, got[i], want))
+                  << "round " << round << " target " << t << " key "
+                  << keySets[s][i];
+            }
+          }
+        }
+      }
+      for (size_t s = 0; s < keySets.size(); ++s) {
+        std::vector<Value> values;
+        Array keysArr(*rt, keySets[s].size()),
+            valuesArr(*rt, keySets[s].size());
+        for (size_t i = 0; i < keySets[s].size(); ++i) {
+          // Numbers and strings that print alike, and a distinct object per
+          // slot, so that only the right value in the right slot passes.
+          if ((i + round) % 3 == 0)
+            values.emplace_back((double)i);
+          else if ((i + round) % 3 == 1)
+            values.emplace_back(
+                String::createFromAscii(*rt, std::to_string(i)));
+          else
+            values.emplace_back(Object(*rt));
+          keysArr.setValueAtIndex(
+              *rt, i, String::createFromUtf8(*rt, keySets[s][i]));
+          valuesArr.setValueAtIndex(*rt, i, Value(*rt, values.back()));
+        }
+        Object made =
+            shapes->createObjectFromShape(*shapeList[s], values.data());
+        Object ref = literal.call(*rt, keysArr, valuesArr).getObject(*rt);
+        EXPECT_EQ(
+            dump.call(*rt, made).getString(*rt).utf8(*rt),
+            dump.call(*rt, ref).getString(*rt).utf8(*rt))
+            << "round " << round << " shape " << s;
+        for (size_t i = 0; i < keySets[s].size(); ++i)
+          EXPECT_TRUE(Value::strictEquals(
+              *rt, made.getProperty(*rt, names[s][i]), values[i]))
+              << "round " << round << " shape " << s << " key "
+              << keySets[s][i];
+      }
+      rt->instrumentation().collectGarbage("HermesObjectShapesTest");
+    }
+    EXPECT_EQ(eval("log.filter(x => x === 'setter').length").getNumber(), 0);
+    eval("delete Object.prototype.a;");
+  }
+  // Arrays: bulk reads equal one-at-a-time reads, holes and errors included.
+  Array arrays =
+      eval(
+          "Array.prototype[1] = 'proto';"
+          "[[1, 2, 3, 4, 5], [1, , 3], [], new Proxy([7, 8, 9], {})]")
+          .getObject(*rt)
+          .getArray(*rt);
+  for (size_t a = 0; a < arrays.size(*rt); ++a) {
+    Array arr = arrays.getValueAtIndex(*rt, a).getObject(*rt).getArray(*rt);
+    size_t n = arr.size(*rt);
+    for (size_t start = 0; start <= n; ++start) {
+      for (size_t count = 0; start + count <= n + 1; ++count) {
+        std::vector<Value> got(count);
+        if (start + count > n) {
+          EXPECT_THROW(
+              shapes->getArrayElements(arr, start, count, got.data()),
+              JSIException);
+          continue;
+        }
+        shapes->getArrayElements(arr, start, count, got.data());
+        for (size_t i = 0; i < count; ++i)
+          EXPECT_TRUE(Value::strictEquals(
+              *rt, got[i], arr.getValueAtIndex(*rt, start + i)))
+              << "array " << a << " index " << start + i;
+      }
+    }
+  }
+  eval("delete Array.prototype[1];");
+
+  // Reads happen in index order, as with getValueAtIndex one at a time: a
+  // getter can grow the array, and a range that ends out of bounds throws
+  // only after the elements before it were read (and their getters ran).
+  {
+    Array grows = eval(
+                      "var grows = [0]; Object.defineProperty(grows, 0, "
+                      "{get() { grows[1] = 2; return 1; }}); grows")
+                      .getObject(*rt)
+                      .getArray(*rt);
+    std::vector<Value> got(2);
+    shapes->getArrayElements(grows, 0, 2, got.data());
+    EXPECT_TRUE(Value::strictEquals(*rt, got[0], Value(1)));
+    EXPECT_TRUE(Value::strictEquals(*rt, got[1], Value(2)));
+
+    Array logs =
+        eval(
+            "var reads = 0; var logs = [0]; Object.defineProperty(logs, 0, "
+            "{get() { reads++; return 'x'; }}); logs")
+            .getObject(*rt)
+            .getArray(*rt);
+    std::vector<Value> got2(2);
+    EXPECT_THROW(
+        shapes->getArrayElements(logs, 0, 2, got2.data()), JSIException);
+    EXPECT_EQ(eval("reads").getNumber(), 1);
+    EXPECT_EQ(got2[0].getString(*rt).utf8(*rt), "x");
+
+    // An empty range reads nothing, wherever it starts.
+    Array small = eval("[1, 2, 3]").getObject(*rt).getArray(*rt);
+    shapes->getArrayElements(small, 10, 0, nullptr);
+  }
+}
+
+// A shape may have up to HiddenClass::kDictionaryThreshold (64) names;
+// creating and reading objects of the largest shape must not exceed the
+// handle limit of a GCScope (checked in debug builds).
+TEST(HermesObjectShapesTest, LargestShape) {
+  auto rt = makeHermesRuntime();
+  auto *shapes = castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+  ASSERT_NE(shapes, nullptr);
+  for (size_t n : {48, 63, 64}) {
+    std::vector<PropNameID> names;
+    for (size_t i = 0; i < n; ++i)
+      names.push_back(PropNameID::forAscii(
+          *rt, "k" + std::to_string(n) + "_" + std::to_string(i)));
+    auto shape = shapes->createObjectShape(names.data(), names.size());
+    ASSERT_NE(shape, nullptr) << n;
+    for (int round = 0; round < 3; ++round) {
+      std::vector<Value> values;
+      for (size_t i = 0; i < n; ++i)
+        values.emplace_back(String::createFromAscii(*rt, std::to_string(i)));
+      Object made = shapes->createObjectFromShape(*shape, values.data());
+      std::vector<Value> got(n);
+      shapes->getShapedProperties(made, *shape, got.data());
+      for (size_t i = 0; i < n; ++i) {
+        EXPECT_TRUE(Value::strictEquals(*rt, got[i], values[i]))
+            << n << " names, index " << i;
+        EXPECT_TRUE(Value::strictEquals(
+            *rt, made.getProperty(*rt, names[i]), values[i]));
+      }
+    }
+  }
+}
+
+// The read cache must follow an object whose properties change after its
+// class was cached: classes that change in place (dictionaries) and classes
+// that the object leaves (a transition to another class).
+TEST(HermesObjectShapesTest, ReadMutateRead) {
+  auto rt = makeHermesRuntime();
+  auto *shapes = castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+  ASSERT_NE(shapes, nullptr);
+  auto eval = [&](const std::string &src) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(src), "");
+  };
+  eval(R"(
+    var get = (o, k) => o[k];
+    var getterCalls = 0;
+    var getter = {get() { getterCalls++; return 'getter'; }, configurable: true};
+    // An object with more than 64 properties: a cacheable dictionary, which
+    // gains properties in place.
+    function big(keys) {
+      var o = {};
+      keys.forEach(k => { o[k] = k + '0'; });
+      for (var i = 0; i < 70; i++) o['p' + i] = i;
+      return o;
+    }
+  )");
+  Function get = rt->global().getPropertyAsFunction(*rt, "get");
+  const std::vector<std::string> keys = {"a", "b", "c"};
+  std::vector<PropNameID> names;
+  for (auto &k : keys)
+    names.push_back(PropNameID::forAscii(*rt, k));
+  auto shape = shapes->createObjectShape(names.data(), names.size());
+  ASSERT_NE(shape, nullptr);
+
+  // Run \p step, then read the global `o` through the shape twice (a miss,
+  // then a hit for a cacheable class) and compare every value with JS. Each
+  // read runs the getters of the names that are accessors once.
+  auto step = [&](const std::string &src, int getters = 0) {
+    eval(src);
+    Object o = rt->global().getPropertyAsObject(*rt, "o");
+    for (int pass = 0; pass < 2; ++pass) {
+      double callsBefore = eval("getterCalls").getNumber();
+      std::vector<Value> got(keys.size());
+      shapes->getShapedProperties(o, *shape, got.data());
+      EXPECT_EQ(eval("getterCalls").getNumber(), callsBefore + getters)
+          << src << " pass " << pass;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        Value want = get.call(*rt, o, String::createFromAscii(*rt, keys[i]));
+        EXPECT_TRUE(Value::strictEquals(*rt, got[i], want))
+            << src << " pass " << pass << " key " << keys[i] << ": got "
+            << got[i].toString(*rt).utf8(*rt) << ", want "
+            << want.toString(*rt).utf8(*rt);
+      }
+    }
+  };
+
+  // A class with no dictionary: every change below gives the object another
+  // class (the first delete makes a cacheable dictionary, the second a
+  // no-cache one).
+  step("var o = {a: 1, b: 2, c: 3};");
+  step("o.a = 5;");
+  step("Object.defineProperty(o, 'b', getter);", 1);
+  step("Object.defineProperty(o, 'b', {value: 'b1', writable: true});");
+  step("delete o.a;");
+  step("o.a = 6;");
+  step("o.x = 'x';");
+  step("delete o.x;");
+  step("Object.freeze(o);");
+
+  // A no-cache dictionary (two deletes) changes in place: deleting and adding
+  // properties reuses slots, so its slots must never be cached.
+  step("var o = {a: 1, b: 2, c: 3, d: 4, e: 5}; delete o.d; delete o.e;");
+  step("delete o.a;");
+  step("o.x = 'x';");
+  step("o.y = 'y';");
+  step("o.a = 'a2';");
+  step("delete o.b; delete o.x; o.z = 'z'; o.b = 'b2';");
+  step("Object.defineProperty(o, 'c', getter);", 1);
+  step("delete o.c; o.c = 'c2';");
+
+  // A cacheable dictionary (more than 64 properties) is cached; adding a
+  // property changes it in place, an accessor or a delete gives the object a
+  // no-cache dictionary.
+  step("var o = big(['a', 'b', 'c']);");
+  step("o.q = 'q';");
+  step("o.a = 'a1';");
+  step("Object.defineProperty(o, 'a', getter);", 1);
+  step("delete o.b;", 1);
+  step("o.b = 'b2';", 1);
+  step("delete o.q; o.r = 'r';", 1);
+  // A cacheable dictionary that misses a name is read the generic way, and
+  // stays correct when the name is added to it in place.
+  step("var o = big(['a', 'b']);");
+  step("o.c = 'c1';");
+  step("o.q = 'q';");
+  step("delete o.c;");
+  step("var o = big(['b', 'c']);");
+  step("Object.prototype.a = 'inherited';");
+  step("o.a = 'own';");
+  step("delete Object.prototype.a;");
+}
+
+// Objects of several classes read in turn through one shape: classes that can
+// be read from slots and classes that cannot (a missing name, an accessor,
+// an inherited name), more classes than the cache holds, and classes that
+// are collected while cached.
+TEST(HermesObjectShapesTest, MixedClasses) {
+  auto rt = makeHermesRuntime();
+  auto *shapes = castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+  ASSERT_NE(shapes, nullptr);
+  auto eval = [&](const std::string &src) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(src), "");
+  };
+  eval(R"(
+    var get = (o, k) => o[k];
+    function list(r) {
+      var proto = {c: 'inherited' + r};
+      var makers = [
+        i => ({a: i, b: r, c: 'c' + i}),
+        i => ({c: i, b: r, a: 'a' + i}),
+        i => ({a: i, b: r}),
+        i => ({a: i, get b() { return 'get' + i; }, c: r}),
+        i => { var o = Object.create(proto); o.a = i; o.b = r; return o; },
+        i => ({a: i, b: r, c: i, d: 'extra'}),
+      ];
+      // Each pattern repeats one maker, alternates two, or cycles through
+      // more than two.
+      var patterns = [[0], [0, 1], [0, 2], [2, 3], [0, 1, 5], [4, 0, 4, 1, 3]];
+      var out = [];
+      patterns.forEach(p => {
+        for (var i = 0; i < 12; i++) out.push(makers[p[i % p.length]](i));
+      });
+      return out;
+    }
+  )");
+  Function get = rt->global().getPropertyAsFunction(*rt, "get");
+  Function list = rt->global().getPropertyAsFunction(*rt, "list");
+  const std::vector<std::string> keys = {"a", "b", "c"};
+  std::vector<PropNameID> names;
+  for (auto &k : keys)
+    names.push_back(PropNameID::forAscii(*rt, k));
+  auto shape = shapes->createObjectShape(names.data(), names.size());
+  ASSERT_NE(shape, nullptr);
+  for (int round = 0; round < 4; ++round) {
+    Array objs = list.call(*rt, round).getObject(*rt).getArray(*rt);
+    for (size_t t = 0; t < objs.size(*rt); ++t) {
+      Object o = objs.getValueAtIndex(*rt, t).getObject(*rt);
+      std::vector<Value> got(keys.size());
+      shapes->getShapedProperties(o, *shape, got.data());
+      for (size_t i = 0; i < keys.size(); ++i) {
+        Value want = get.call(*rt, o, String::createFromAscii(*rt, keys[i]));
+        EXPECT_TRUE(Value::strictEquals(*rt, got[i], want))
+            << "round " << round << " object " << t << " key " << keys[i];
+      }
+    }
+    // The classes cached in this round may be collected.
+    rt->instrumentation().collectGarbage("HermesObjectShapesTest");
+  }
+}
+
+// getArrayElements over arrays whose length exceeds their storage, frozen
+// arrays, and arrays changed between reads.
+TEST(HermesObjectShapesTest, ArrayStorage) {
+  auto rt = makeHermesRuntime();
+  auto *shapes = castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+  ASSERT_NE(shapes, nullptr);
+  auto eval = [&](const std::string &src) {
+    return rt->evaluateJavaScript(std::make_shared<StringBuffer>(src), "");
+  };
+  // Every range of \p arr, compared with getValueAtIndex one at a time;
+  // ranges that end past the length throw.
+  auto checkAll = [&](const Array &arr, const std::string &what) {
+    size_t n = arr.size(*rt);
+    for (size_t start = 0; start <= n + 1; ++start) {
+      for (size_t count = 0; start + count <= n + 1; ++count) {
+        std::vector<Value> got(count);
+        if (count && start + count > n) {
+          EXPECT_THROW(
+              shapes->getArrayElements(arr, start, count, got.data()),
+              JSIException)
+              << what << " start " << start << " count " << count;
+          continue;
+        }
+        shapes->getArrayElements(arr, start, count, got.data());
+        for (size_t i = 0; i < count; ++i)
+          EXPECT_TRUE(Value::strictEquals(
+              *rt, got[i], arr.getValueAtIndex(*rt, start + i)))
+              << what << " index " << start + i;
+      }
+    }
+  };
+  const char *arrays[] = {
+      "new Array(4)",
+      "var a = [1]; a.length = 8; a",
+      "var a = [1, 2]; a[6] = 7; a",
+      "Object.freeze([1, 'two', {}])",
+      "Object.freeze([1, , 3])",
+      "var a = [1, 2, 3]; a.length = 6; Object.freeze(a)",
+  };
+  for (int withProto = 0; withProto < 2; ++withProto) {
+    // Holes read from the prototype when it has the index.
+    if (withProto)
+      eval("Array.prototype[1] = 'p1'; Array.prototype[5] = 'p5';");
+    for (const char *src : arrays)
+      checkAll(eval(src).getObject(*rt).getArray(*rt), src);
+  }
+  eval("delete Array.prototype[1]; delete Array.prototype[5];");
+
+  // The same array, read after each change.
+  Array arr = eval("var arr = [1, 2, 3]; arr").getObject(*rt).getArray(*rt);
+  const char *changes[] = {
+      "arr.length = 1",
+      "arr.push(9, 8)",
+      "arr.length = 10",
+      "arr[4] = 'four'",
+      "delete arr[1]",
+      "Object.defineProperty(arr, 0, {get() { return 'g'; }})",
+      "Object.freeze(arr)",
+  };
+  checkAll(arr, "arr");
+  for (const char *src : changes) {
+    eval(src);
+    checkAll(arr, src);
+  }
+}
+
+// A shape held by a host function, a host object or native state is released
+// when the runtime finalizes them, while the runtime is destroyed: by the
+// finalizer executor, possibly after the runtime's destructor body. The
+// holders below release their shape late so that, in debug builds, the
+// runtime's list of live shapes asserts if it is destroyed before the
+// executor has run them.
+TEST(HermesObjectShapesTest, ReleasedWithRuntime) {
+  std::weak_ptr<facebook::hermes::IObjectShape> weak;
+  {
+    auto rt = makeHermesRuntime();
+    auto *shapes =
+        castInterface<facebook::hermes::IHermesObjectShapes>(rt.get());
+    ASSERT_NE(shapes, nullptr);
+    PropNameID name = PropNameID::forAscii(*rt, "a");
+    std::shared_ptr<facebook::hermes::IObjectShape> shape =
+        shapes->createObjectShape(&name, 1);
+    ASSERT_NE(shape, nullptr);
+    weak = shape;
+    // Cache classes in the shape.
+    Value value(1);
+    Object made = shapes->createObjectFromShape(*shape, &value);
+    Value got;
+    shapes->getShapedProperties(made, *shape, &got);
+    EXPECT_EQ(got.getNumber(), 1);
+
+    rt->global().setProperty(
+        *rt,
+        "f",
+        Function::createFromHostFunction(
+            *rt,
+            name,
+            0,
+            [shape](Runtime &, const Value &, const Value *, size_t) {
+              return Value();
+            }));
+    struct Holder : public HostObject, public NativeState {
+      explicit Holder(std::shared_ptr<facebook::hermes::IObjectShape> s)
+          : shape(std::move(s)) {}
+      ~Holder() override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      std::shared_ptr<facebook::hermes::IObjectShape> shape;
+    };
+    rt->global().setProperty(
+        *rt,
+        "host",
+        Object::createFromHostObject(*rt, std::make_shared<Holder>(shape)));
+    Object withState(*rt);
+    withState.setNativeState(*rt, std::make_shared<Holder>(shape));
+    rt->global().setProperty(*rt, "withState", withState);
+  }
+  EXPECT_TRUE(weak.expired());
 }
 
 INSTANTIATE_TEST_CASE_P(
