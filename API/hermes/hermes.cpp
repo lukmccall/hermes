@@ -1504,9 +1504,13 @@ class HermesRuntimeImpl final : public HermesRuntime,
 
   /// \return the slot of the own data property \p name of \p self, filling
   /// the cache on a miss, or None when the generic path has to handle it.
-  /// Does not allocate.
+  /// If \p absent is given, it is set when the property map shows that
+  /// \p self has no own property \p name at all. Does not allocate.
   LLVM_ATTRIBUTE_ALWAYS_INLINE ::hermes::OptValue<vm::SlotIndex>
-  cachedOwnDataSlot(vm::JSObject *self, vm::SymbolID name) {
+  cachedOwnDataSlot(
+      vm::JSObject *self,
+      vm::SymbolID name,
+      bool *absent = nullptr) {
     vm::CompressedPointer clazzPtr{self->getClassGCPtr()};
     PropertyReadCacheEntry &entry =
         propertyReadCache_[propertyCacheIndex(clazzPtr, name)];
@@ -1524,6 +1528,8 @@ class HermesRuntimeImpl final : public HermesRuntime,
     vm::NamedPropertyDescriptor desc;
     ::hermes::OptValue<bool> found =
         vm::JSObject::tryGetOwnNamedDescriptorFast(self, runtime_, name, desc);
+    if (absent && found.hasValue() && !found.getValue())
+      *absent = true;
     if (found.hasValue() && found.getValue() && !desc.flags.accessor) {
       // Only getNamedDescriptorUnsafe synthesizes these, not a map lookup.
       assert(!desc.flags.hostObject && !desc.flags.proxyObject);
@@ -2784,6 +2790,19 @@ std::shared_ptr<jsi::HostObject> HermesRuntimeImpl::getHostObject(
 
 bool HermesRuntimeImpl::hasNativeState(const jsi::Object &obj) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  // A cached slot for the internal native state property means it is there;
+  // a property map that lacks it means it is not. (Proxies and host objects
+  // are skipped by the cache and take the path below.)
+  bool absent = false;
+  if (cachedOwnDataSlot(
+          vm::vmcast<vm::JSObject>(phv(obj)),
+          vm::Predefined::getSymbolID(
+              vm::Predefined::InternalPropertyNativeState),
+          &absent)) {
+    return true;
+  }
+  if (absent)
+    return false;
   vm::GCScope gcScope(runtime_);
   auto h = handle(obj);
   if (h->isProxyObject(runtime_) || h->isHostObject(runtime_)) {
@@ -2838,6 +2857,19 @@ void HermesRuntimeImpl::setNativeState(
 std::shared_ptr<jsi::NativeState> HermesRuntimeImpl::getNativeState(
     const jsi::Object &obj) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  {
+    auto *self = vm::vmcast<vm::JSObject>(phv(obj));
+    if (auto slot = cachedOwnDataSlot(
+            self,
+            vm::Predefined::getSymbolID(
+                vm::Predefined::InternalPropertyNativeState))) {
+      vm::NoAllocScope scope(runtime_);
+      vm::NativeState *ns = vm::vmcast<vm::NativeState>(
+          vm::JSObject::getNamedSlotValueUnsafe(self, runtime_, *slot)
+              .getObject(runtime_));
+      return reinterpret_cast<NativeStateContext *>(ns->context())->state;
+    }
+  }
   vm::GCScope gcScope(runtime_);
   assert(hasNativeState(obj) && "object lacks native state");
   auto h = handle(obj);

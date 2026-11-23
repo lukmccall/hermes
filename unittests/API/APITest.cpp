@@ -4802,6 +4802,93 @@ TEST_P(HermesRuntimeTest, GetPropertyCacheMatchesJS) {
   }
 }
 
+// hasNativeState and getNativeState find the internal property through the
+// getProperty cache. Objects that share a class must still answer for
+// themselves, including after their class changes (property deletion, which
+// makes a dictionary, and freezing), with the internal property in a direct or
+// an indirect slot, and objects that never get a state must keep reporting
+// none.
+TEST_P(HermesRuntimeTest, NativeStateLookupsThroughCache) {
+  struct Tagged : NativeState {
+    explicit Tagged(int tag) : tag(tag) {}
+    int tag;
+  };
+  Array objs =
+      eval(
+          "var objs = [];"
+          "for (var i = 0; i < 40; i++) objs.push("
+          "    i % 4 === 3"
+          "      ? {a: i, b: 1, c: 2, d: 3, e: 4, f: 5, g: 6, h: 7, k: 8, l: 9}"
+          "  : i % 2 ? {a: i} : {a: i, b: 1});"
+          "objs")
+          .getObject(*rt)
+          .getArray(*rt);
+  std::vector<bool> attached(objs.size(*rt), false);
+  for (int round = 0; round < 6; ++round) {
+    for (size_t i = 0; i < objs.size(*rt); ++i) {
+      Object o = objs.getValueAtIndex(*rt, i).getObject(*rt);
+      // Every fifth object never gets a state.
+      if ((i + round) % 3 == 0 && i % 5 != 4 && !attached[i] && round < 4) {
+        o.setNativeState(*rt, std::make_shared<Tagged>((int)i));
+        attached[i] = true;
+      }
+    }
+    // Every object, attached or not, answers for itself.
+    for (size_t i = 0; i < objs.size(*rt); ++i) {
+      Object o = objs.getValueAtIndex(*rt, i).getObject(*rt);
+      EXPECT_EQ(o.hasNativeState(*rt), (bool)attached[i])
+          << "round " << round << " object " << i;
+      if (attached[i])
+        EXPECT_EQ(o.getNativeState<Tagged>(*rt)->tag, (int)i);
+    }
+    if (round == 1)
+      eval("objs.forEach((o, i) => { if (i % 7 === 0) delete o.a; });");
+    if (round == 3)
+      eval("objs.forEach(o => Object.freeze(o));");
+    rt->instrumentation().collectGarbage("NativeStateLookupsThroughCache");
+  }
+  // Objects that never got a native state report none, however warm the cache.
+  Object fresh(*rt);
+  EXPECT_FALSE(fresh.hasNativeState(*rt));
+  // Same keys as the cached objects: shares their original class, which has
+  // no native state.
+  Object withA = eval("({a: 1, b: 1})").getObject(*rt);
+  EXPECT_FALSE(withA.hasNativeState(*rt));
+  Object proxy = eval("new Proxy({}, {})").getObject(*rt);
+  EXPECT_FALSE(proxy.hasNativeState(*rt));
+  Object host = Object::createFromHostObject(
+      *rt, std::make_shared<facebook::jsi::HostObject>());
+  EXPECT_FALSE(host.hasNativeState(*rt));
+
+  // Replacing the state of objects whose class is cached (the objects above
+  // are frozen, so this uses new ones): the slot is reused, and the new state
+  // must be returned.
+  Array fresh2 = eval("Array.from({length: 10}, (_, i) => ({a: i, z: 1}))")
+                     .getObject(*rt)
+                     .getArray(*rt);
+  for (int step = 0; step < 3; ++step) {
+    for (size_t i = 0; i < fresh2.size(*rt); ++i) {
+      Object o = fresh2.getValueAtIndex(*rt, i).getObject(*rt);
+      o.setNativeState(*rt, std::make_shared<Tagged>(step * 100 + (int)i));
+    }
+    for (size_t i = 0; i < fresh2.size(*rt); ++i) {
+      Object o = fresh2.getValueAtIndex(*rt, i).getObject(*rt);
+      ASSERT_TRUE(o.hasNativeState(*rt));
+      EXPECT_EQ(o.getNativeState<Tagged>(*rt)->tag, step * 100 + (int)i);
+    }
+  }
+
+  // An array (indexed storage, which the cache refuses) with a state, next
+  // to one without.
+  Array withState(*rt, 3), without(*rt, 3);
+  withState.setNativeState(*rt, std::make_shared<Tagged>(7));
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(withState.hasNativeState(*rt));
+    EXPECT_EQ(withState.getNativeState<Tagged>(*rt)->tag, 7);
+    EXPECT_FALSE(without.hasNativeState(*rt));
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(
     Runtimes,
     HermesRuntimeTest,
