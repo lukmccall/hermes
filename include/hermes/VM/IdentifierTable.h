@@ -130,6 +130,11 @@ class IdentifierTable {
   SymbolID
   registerLazyIdentifier(Runtime &runtime, UTF16Ref str, uint32_t hash);
 
+  /// \return the SymbolID that the uniqued string primitive \p str stands
+  /// for. Does not allocate.
+  /// \pre str->isUniqued().
+  static SymbolID uniqueIDOf(Runtime &runtime, const StringPrimitive *str);
+
   /// \return the SymbolID of the string primitive \p str.
   CallResult<Handle<SymbolID>> getSymbolHandleFromPrimitive(
       Runtime &runtime,

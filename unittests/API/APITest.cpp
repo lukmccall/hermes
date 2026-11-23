@@ -4614,6 +4614,194 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
   }
 }
 
+// A uniqued string keeps its identifier alive only weakly: a collection that
+// finds no other reference frees the SymbolID, and the next new identifier
+// reuses it. Reading a proxy takes the generic path, which first reads the
+// handler's `get` trap. Here that read runs a getter that collects and then
+// creates identifiers, before the key is handed to the trap; the trap must
+// still receive the original key.
+TEST_P(HermesRuntimeTest, GetPropertyByUniquedStringSurvivesGCInTrap) {
+  rt->global().setProperty(
+      *rt,
+      "forceGC",
+      Function::createFromHostFunction(
+          *rt,
+          PropNameID::forAscii(*rt, "forceGC"),
+          0,
+          [](Runtime &rt, const Value &, const Value *, size_t) {
+            rt.instrumentation().collectGarbage("forceGC");
+            return Value::undefined();
+          }));
+  Object proxy = eval(R"(
+    var handler = {};
+    Object.defineProperty(handler, 'get', {get() {
+      forceGC();
+      var o = {};
+      for (var i = 0; i < 200; i++) o['interned' + i + Math.random()] = i;
+      return function(t, k) { return k; };
+    }});
+    new Proxy({}, handler)
+  )")
+                     .getObject(*rt);
+  for (int i = 0; i < 20; ++i) {
+    // The key's object is dropped right away; once it is collected, nothing
+    // but the (uniqued) string refers to the identifier. Do not collect
+    // before the read: that would free the identifier and un-unique the
+    // string, and the read would intern it again.
+    String key =
+        eval("Object.keys({['dyn' + Math.random()]: 1})[0]").getString(*rt);
+    std::string expected = key.utf8(*rt);
+    Value got = proxy.getProperty(*rt, key);
+    ASSERT_TRUE(got.isString());
+    EXPECT_EQ(got.getString(*rt).utf8(*rt), expected);
+  }
+}
+
+// getProperty caches the slot of own data properties per hidden class. Every
+// read through the cache must agree with the same read done by JS, for every
+// way of naming the property, including after cached classes change and die.
+TEST_P(HermesRuntimeTest, GetPropertyCacheMatchesJS) {
+  class Host : public HostObject {
+   public:
+    Value get(Runtime &rt, const PropNameID &name) override {
+      return String::createFromUtf8(rt, "host:" + name.utf8(rt));
+    }
+  };
+  eval(R"(
+    var get = (o, k) => o[k];
+    var sym = Symbol('s');
+    // Objects get round % 3 leading properties, so the same keys sit in
+    // different slots from round to round: an entry left behind for a dead
+    // class whose address is reused would read the wrong slot.
+    function lead(round, o) {
+      var r = {};
+      for (var i = 0; i < round % 3; i++) r['p' + i] = i;
+      return Object.assign(r, o);
+    }
+    function make(round, host) {
+      var objs = [];
+      objs.push(lead(round, {a: 1, b: 'two', c: 3.5}));
+      objs.push(lead(round, {a: round, b: {}, c: undefined}));   // same class
+      objs.push(lead(round, {b: 2, a: 1, c: 3}));                // other order
+      objs.push(Object.create({a: 'proto', c: 'inh'}));
+      objs.push(Object.defineProperty(lead(round, {a: 1, b: 2, c: 3}), 'b',
+          {get() { return 'getter'; }}));
+      var d = lead(round, {a: 1, b: 2, c: 3, e: 4}); delete d.e; objs.push(d);
+      objs.push(new Proxy({a: 1}, {get(t, k) { return 'trap:' + String(k); }}));
+      objs.push(Object.freeze(lead(round, {a: 'frozen', b: 1, c: 2})));
+      objs.push(new String('abc'));
+      objs.push([10, 20, 30]);
+      objs.push(new Uint8Array([5, 6, 7]));
+      // Never touched, so its name/length/prototype are still lazy.
+      objs.push(function lazyFn(x, y) {});
+      objs.push(Object.defineProperty({a: 1}, 'b',
+          {get() { throw new Error('boom ' + round); }}));
+      var s = {a: 's', b: 2}; s[sym] = 'bySymbol'; s[''] = 'empty';
+      s['1abc'] = 'digit'; objs.push(s);
+      objs.push(host);
+      var hp = Object.create(host); hp.a = 'own'; objs.push(hp);
+      return objs;
+    }
+    // Mutations of objects whose classes are cached by now; n is 1, then 2.
+    function mutate(objs, n) {
+      var first = objs[0]; delete first.b; first.d = n;
+      // A dictionary. The first call moves it to an uncacheable class; the
+      // second changes that class in place: a new key takes the slot that
+      // the deleted 'a' frees, 'a' moves to another slot, and a data
+      // property that reads may have cached becomes a getter.
+      var d = objs[5];
+      delete d.a; d['x' + n] = n; d.a = 'moved' + n;
+      Object.defineProperty(d, n == 1 ? 'c' : 'b',
+          {get() { return 'dget' + n; }});
+      var s = objs[13]; s.a = 'changed' + n; s[sym] = 'symChanged' + n;
+    }
+  )");
+  Function make = rt->global().getPropertyAsFunction(*rt, "make");
+  Function mutate = rt->global().getPropertyAsFunction(*rt, "mutate");
+  Function get = rt->global().getPropertyAsFunction(*rt, "get");
+  Value sym = rt->global().getProperty(*rt, "sym");
+  Object host = Object::createFromHostObject(*rt, std::make_shared<Host>());
+  const char *keys[] = {
+      "a",
+      "b",
+      "c",
+      "d",
+      "x1",
+      "x2",
+      "length",
+      "1",
+      "missing",
+      "name",
+      "prototype",
+      "",
+      "1abc"};
+  // A read that throws compares by message.
+  auto read = [&](const std::function<Value()> &f) {
+    try {
+      return std::make_pair(f(), std::string());
+    } catch (const JSError &e) {
+      return std::make_pair(Value(), "threw: " + e.getMessage());
+    }
+  };
+  auto same = [&](const std::pair<Value, std::string> &x,
+                  const std::pair<Value, std::string> &y) {
+    return x.second == y.second && Value::strictEquals(*rt, x.first, y.first);
+  };
+  for (int round = 0; round < 20; ++round) {
+    Array objs = make.call(*rt, round, host).getObject(*rt).getArray(*rt);
+    for (int pass = 0; pass < 4; ++pass) {
+      for (size_t i = 0; i < objs.size(*rt); ++i) {
+        Object obj = objs.getValueAtIndex(*rt, i).getObject(*rt);
+        for (const char *key : keys) {
+          auto want = read([&] { return get.call(*rt, obj, key); });
+          // PropNameID, a uniqued string, and a fresh string.
+          auto byName = read([&] {
+            return obj.getProperty(*rt, PropNameID::forAscii(*rt, key));
+          });
+          auto byUniqued = read([&] {
+            return obj.getProperty(
+                *rt,
+                eval((std::string("'") + key + "'").c_str()).getString(*rt));
+          });
+          auto byFresh = read([&] {
+            return obj.getProperty(*rt, String::createFromAscii(*rt, key));
+          });
+          EXPECT_TRUE(same(byName, want))
+              << "round " << round << " object " << i << " key '" << key << "' "
+              << byName.second << " / " << want.second;
+          EXPECT_TRUE(same(byUniqued, want))
+              << "round " << round << " object " << i << " key '" << key << "'";
+          EXPECT_TRUE(same(byFresh, want))
+              << "round " << round << " object " << i << " key '" << key << "'";
+        }
+        // A Symbol-keyed PropNameID.
+        auto wantSym = read([&] { return get.call(*rt, obj, sym); });
+        auto bySym = read([&] {
+          return obj.getProperty(
+              *rt, PropNameID::forSymbol(*rt, sym.getSymbol(*rt)));
+        });
+        EXPECT_TRUE(same(bySym, wantSym))
+            << "round " << round << " object " << i << " symbol key";
+      }
+      if (pass == 1 || pass == 2)
+        mutate.call(*rt, objs, pass);
+    }
+    // A function whose properties are still lazy, read through JSI before
+    // anything in JS touches it.
+    {
+      Object lazyFn = eval("(function lazyRead(a, b, c) {})").getObject(*rt);
+      Value name = lazyFn.getProperty(*rt, "name");
+      Value length = lazyFn.getProperty(*rt, "length");
+      Value proto = lazyFn.getProperty(*rt, "prototype");
+      EXPECT_EQ(name.getString(*rt).utf8(*rt), "lazyRead");
+      EXPECT_EQ(length.getNumber(), 3);
+      EXPECT_TRUE(
+          Value::strictEquals(*rt, proto, get.call(*rt, lazyFn, "prototype")));
+    }
+    rt->instrumentation().collectGarbage("GetPropertyCacheMatchesJS");
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(
     Runtimes,
     HermesRuntimeTest,

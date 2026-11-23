@@ -61,6 +61,7 @@
 #include "llvh/Support/raw_os_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <list>
@@ -359,6 +360,9 @@ class HermesRuntimeImpl final : public HermesRuntime,
             // the iteration will not destroy the WeakRoot.
             acceptor.acceptWeak(element.valueUnsafe());
           });
+          for (auto &entry : propertyReadCache_) {
+            acceptor.acceptWeak(entry.clazz);
+          }
         });
 #ifdef HERMES_MEMORY_INSTRUMENTATION
     runtime_.addCustomSnapshotFunction(
@@ -1472,6 +1476,84 @@ class HermesRuntimeImpl final : public HermesRuntime,
 
   /// ExecutionScope for this Runtime.
   MutatorScope mutatorScope;
+
+  /// An inline cache for getProperty, the JSI counterpart of the
+  /// interpreter's GetById read cache. Each entry maps a (hidden class,
+  /// property name) pair to the slot of an own data property, under the
+  /// interpreter's rules: the class is held weakly (an entry for a dead class
+  /// is cleared), classes in uncacheable dictionary mode are never cached, and
+  /// a live class keeps the SymbolIDs of its properties alive, so a cached name
+  /// cannot be recycled under an entry. The class also determines whether the
+  /// object is a proxy, host object, lazy object or has indexed storage.
+  struct PropertyReadCacheEntry {
+    vm::WeakRoot<vm::HiddenClass> clazz{nullptr};
+    vm::SymbolID name{};
+    vm::SlotIndex slot{0};
+  };
+  static constexpr size_t kPropertyReadCacheSize = 256;
+  std::array<PropertyReadCacheEntry, kPropertyReadCacheSize>
+      propertyReadCache_{};
+
+  static size_t propertyCacheIndex(
+      vm::CompressedPointer clazz,
+      vm::SymbolID name) {
+    uint64_t h = (uint64_t)clazz.getRaw() * 0x9E3779B97F4A7C15ull ^
+        (uint64_t)name.unsafeGetRaw() * 0xC2B2AE3D27D4EB4Full;
+    return (size_t)(h >> 56) & (kPropertyReadCacheSize - 1);
+  }
+
+  /// \return the slot of the own data property \p name of \p self, filling
+  /// the cache on a miss, or None when the generic path has to handle it.
+  /// Does not allocate.
+  LLVM_ATTRIBUTE_ALWAYS_INLINE ::hermes::OptValue<vm::SlotIndex>
+  cachedOwnDataSlot(vm::JSObject *self, vm::SymbolID name) {
+    vm::CompressedPointer clazzPtr{self->getClassGCPtr()};
+    PropertyReadCacheEntry &entry =
+        propertyReadCache_[propertyCacheIndex(clazzPtr, name)];
+    if (LLVM_LIKELY(entry.clazz == clazzPtr && entry.name == name)) {
+      return entry.slot;
+    }
+    vm::HiddenClass *clazz = self->getClass(runtime_);
+    // Classes the cache never accepts: bail out before probing the map, so
+    // that their reads pay only for the generic path.
+    if (clazz->hasIndexedStorage() || clazz->isDictionaryNoCache() ||
+        clazz->isHostObject() || clazz->isProxyObject() ||
+        clazz->isLazyObject()) {
+      return llvh::None;
+    }
+    vm::NamedPropertyDescriptor desc;
+    ::hermes::OptValue<bool> found =
+        vm::JSObject::tryGetOwnNamedDescriptorFast(self, runtime_, name, desc);
+    if (found.hasValue() && found.getValue() && !desc.flags.accessor) {
+      // Only getNamedDescriptorUnsafe synthesizes these, not a map lookup.
+      assert(!desc.flags.hostObject && !desc.flags.proxyObject);
+      entry.clazz = clazzPtr;
+      entry.name = name;
+      entry.slot = desc.slot;
+      return desc.slot;
+    }
+    return llvh::None;
+  }
+
+  /// getProperty by an interned name, through the cache.
+  LLVM_ATTRIBUTE_ALWAYS_INLINE jsi::Value getNamedProperty(
+      const jsi::Object &obj,
+      vm::SymbolID name) {
+    auto *self = vm::vmcast<vm::JSObject>(phv(obj));
+    if (auto slot = cachedOwnDataSlot(self, name)) {
+      return valueFromHermesValue(
+          vm::JSObject::getNamedSlotValueUnsafe(self, runtime_, *slot)
+              .unboxToHV(runtime_));
+    }
+    vm::GCScope gcScope(runtime_);
+    // The generic lookup can run JS (proxy traps, getters) and collect. A
+    // uniqued string keeps its SymbolID only weakly, so root the name here.
+    auto nameHandle = runtime_.makeHandle(name);
+    auto h = handle(obj);
+    auto res = h->getNamedOrIndexed(h, runtime_, *nameHandle);
+    checkStatus(res.getStatus());
+    return valueFromHermesValue(res->get());
+  }
 };
 
 void HermesRuntimeImpl::maybeScheduleIdleGC() {
@@ -2892,6 +2974,28 @@ jsi::Value HermesRuntimeImpl::getProperty(
     const jsi::Object &obj,
     const jsi::String &name) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  {
+    vm::StringPrimitive *str = phv(name).getString();
+    // Keys that start with a digit keep the computed path, which applies
+    // array index semantics; this also sends some keys that are not indices
+    // ("1abc", "01") there, which is correct, just not cached.
+    uint32_t len = str->getStringLength();
+    char16_t first = len == 0 ? 0 : str->at(0);
+    if (len != 0 && !(first >= u'0' && first <= u'9')) {
+      if (str->isUniqued()) {
+        // A uniqued string already is a property name.
+        return getNamedProperty(
+            obj, vm::IdentifierTable::uniqueIDOf(runtime_, str));
+      }
+      // getComputed interns the key first anyway; doing it here lets the
+      // lookup go through the cache.
+      vm::GCScope gcScope(runtime_);
+      auto symRes = runtime_.getIdentifierTable().getSymbolHandleFromPrimitive(
+          runtime_, vm::createPseudoHandle(str));
+      checkStatus(symRes.getStatus());
+      return getNamedProperty(obj, **symRes);
+    }
+  }
   vm::GCScope gcScope(runtime_);
   auto h = handle(obj);
   auto res = h->getComputed_RJS(h, runtime_, stringHandle(name));
@@ -2903,12 +3007,7 @@ jsi::Value HermesRuntimeImpl::getProperty(
     const jsi::Object &obj,
     const jsi::PropNameID &name) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
-  vm::GCScope gcScope(runtime_);
-  auto h = handle(obj);
-  vm::SymbolID nameID = phv(name).getSymbol();
-  auto res = h->getNamedOrIndexed(h, runtime_, nameID);
-  checkStatus(res.getStatus());
-  return valueFromHermesValue(res->get());
+  return getNamedProperty(obj, phv(name).getSymbol());
 }
 
 jsi::Value HermesRuntimeImpl::getProperty(

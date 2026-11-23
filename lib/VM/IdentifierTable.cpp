@@ -98,6 +98,12 @@ SymbolID IdentifierTable::registerLazyIdentifier(
   return registerLazyIdentifierImpl(runtime, str, hash);
 }
 
+SymbolID IdentifierTable::uniqueIDOf(
+    Runtime &runtime,
+    const StringPrimitive *str) {
+  return str->getUniqueID(runtime);
+}
+
 CallResult<Handle<SymbolID>> IdentifierTable::getSymbolHandleFromPrimitive(
     Runtime &runtime,
     PseudoHandle<StringPrimitive> str) {
