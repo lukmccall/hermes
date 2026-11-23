@@ -7,6 +7,8 @@
 
 #include "hermes/Support/UTF8.h"
 
+#include <cstring>
+
 namespace hermes {
 
 void encodeUTF8(char *&dst, uint32_t cp) {
@@ -283,11 +285,31 @@ bool isAllASCII(const uint8_t *start, const uint8_t *end) {
 #endif
 
 bool isAllASCII(const char16_t *start, const char16_t *end) {
-  for (; start != end; ++start) {
-    if (*start > 0x7F)
+  // Four UTF-16 code units per 64-bit word: any bit above 0x7F in any unit
+  // fails. The words are loaded with memcpy, which compilers turn into a
+  // single unaligned load and which is portable (unlike an aligned(1)
+  // typedef, which MSVC does not accept).
+  auto load = [](const char16_t *p) {
+    uint64_t w;
+    std::memcpy(&w, p, sizeof(w));
+    return w;
+  };
+  static constexpr uint64_t kMask = 0xFF80FF80FF80FF80ull;
+  uint64_t acc = 0;
+  while (end - start >= 16) {
+    acc |= load(start) | load(start + 4) | load(start + 8) | load(start + 12);
+    if (acc & kMask)
       return false;
+    start += 16;
   }
-  return true;
+  while (end - start >= 4) {
+    acc |= load(start);
+    start += 4;
+  }
+  uint16_t tail = 0;
+  for (; start != end; ++start)
+    tail |= *start;
+  return ((acc & kMask) | (tail & 0xFF80)) == 0;
 }
 
 } // namespace hermes

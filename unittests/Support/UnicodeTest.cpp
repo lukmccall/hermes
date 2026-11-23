@@ -10,6 +10,8 @@
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <string>
 #include <vector>
 
 using namespace hermes;
@@ -144,6 +146,51 @@ TEST(StringTest, IsAllASCIITest) {
          end++) {
       // Only zero-length substrings are ASCII.
       EXPECT_EQ(start == end, isAllASCII(&noAsciiArr[start], &noAsciiArr[end]));
+    }
+  }
+}
+
+// The char16_t overload checks four code units at a time. Check every length
+// and position against a unit-by-unit check.
+TEST(StringTest, IsAllASCIIUTF16AllPositions) {
+  const char16_t nonAscii[] = {0x80, 0xFF, 0x100, 0x7FF, 0xD800, 0xFFFF};
+  for (size_t len = 0; len <= 70; ++len) {
+    std::u16string s(len, u'a');
+    EXPECT_TRUE(isAllASCII(s.data(), s.data() + s.size())) << len;
+    if (len) {
+      // 0x7F is the largest ASCII code unit.
+      std::u16string top = s;
+      top[len - 1] = 0x7F;
+      EXPECT_TRUE(isAllASCII(top.data(), top.data() + top.size())) << len;
+    }
+    for (size_t pos = 0; pos < len; ++pos) {
+      for (char16_t c : nonAscii) {
+        std::u16string t = s;
+        t[pos] = c;
+        EXPECT_FALSE(isAllASCII(t.data(), t.data() + t.size()))
+            << "len " << len << " pos " << pos << " unit " << (int)c;
+        // A sub-range that excludes the non-ASCII unit is ASCII.
+        EXPECT_TRUE(isAllASCII(t.data(), t.data() + pos));
+      }
+    }
+  }
+}
+
+// The same, starting at every offset 0-3 code units from an 8-byte boundary,
+// so the 64-bit loads are unaligned in all the ways they can be.
+TEST(StringTest, IsAllASCIIUTF16Offsets) {
+  alignas(8) char16_t buf[96];
+  for (size_t offset = 0; offset < 4; ++offset) {
+    for (size_t len = 0; len + offset <= 90; ++len) {
+      char16_t *s = buf + offset;
+      std::fill(s, s + len, u'a');
+      EXPECT_TRUE(isAllASCII(s, s + len)) << offset << " " << len;
+      for (size_t pos = 0; pos < len; ++pos) {
+        s[pos] = 0x80;
+        EXPECT_FALSE(isAllASCII(s, s + len))
+            << "offset " << offset << " len " << len << " pos " << pos;
+        s[pos] = u'a';
+      }
     }
   }
 }
