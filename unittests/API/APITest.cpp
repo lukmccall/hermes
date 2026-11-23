@@ -4614,6 +4614,432 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
   }
 }
 
+// Values stored through the setProperty caches, into direct and indirect
+// slots, must survive collections that happen between the stores, including
+// heap-allocated ones (doubles in HV32 builds, strings, objects). The first
+// generation of stores adds the properties (add cache); the following ones
+// overwrite them (write cache).
+TEST_P(HermesRuntimeTest, SetPropertyCacheValuesSurviveGC) {
+  Function check = eval(R"((function(o, stamp) {
+    for (var k = 0; k < 10; k++) {
+      var v = o['f' + k];
+      var ok = k % 3 === 0 ? v === stamp + 0.1 * k
+             : k % 3 === 1 ? v === 's' + stamp + '_' + k
+             : typeof v === 'object' && v.tag === stamp * 100 + k;
+      if (!ok) return 'f' + k;
+    }
+    return 'ok';
+  }))")
+                       .getObject(*rt)
+                       .getFunction(*rt);
+  std::vector<PropNameID> names;
+  for (int k = 0; k < 10; ++k)
+    names.push_back(PropNameID::forUtf8(*rt, "f" + std::to_string(k)));
+  for (int round = 0; round < 30; ++round) {
+    Object o(*rt);
+    for (int gen = 0; gen < 4; ++gen) {
+      int stamp = round * 4 + gen;
+      for (int k = 0; k < 10; ++k) {
+        Value v;
+        if (k % 3 == 0) {
+          v = Value(stamp + 0.1 * k);
+        } else if (k % 3 == 1) {
+          v = String::createFromUtf8(
+              *rt, "s" + std::to_string(stamp) + "_" + std::to_string(k));
+        } else {
+          Object tagged(*rt);
+          tagged.setProperty(*rt, "tag", stamp * 100 + k);
+          v = std::move(tagged);
+        }
+        o.setProperty(*rt, names[k], v);
+        if (k % 4 == 3)
+          rt->instrumentation().collectGarbage("SetPropertyCacheValues");
+      }
+      rt->instrumentation().collectGarbage("SetPropertyCacheValues");
+      EXPECT_EQ(check.call(*rt, o, stamp).getString(*rt).utf8(*rt), "ok")
+          << "round " << round << " generation " << gen;
+    }
+  }
+}
+
+namespace {
+/// A HostObject that records the stores it receives and refuses 'ro'. Its
+/// '__dump' property returns the record.
+class RecordingHostObject final : public HostObject {
+ public:
+  Value get(Runtime &rt, const PropNameID &name) override {
+    if (name.utf8(rt) == "__dump")
+      return String::createFromUtf8(rt, log_);
+    return Value::undefined();
+  }
+  void set(Runtime &rt, const PropNameID &name, const Value &value) override {
+    std::string n = name.utf8(rt);
+    if (n == "ro")
+      throw JSError(rt, "host object refuses ro");
+    log_ += n + "=" + value.toString(rt).utf8(rt) + ";";
+  }
+  std::vector<PropNameID> getPropertyNames(Runtime &) override {
+    return {};
+  }
+
+ private:
+  std::string log_;
+};
+} // namespace
+
+// setProperty caches stores to existing properties and property additions.
+// Every store through JSI must have the same effect as the same store done by
+// strict-mode JS on a twin object, including when prototype chains change
+// after the caches are warm. Each store is done four ways, on four twin
+// objects: by PropNameID, by String, by JS `o.k = v` (PutById) and by JS
+// `o[k] = v` (PutByVal). setProperty by PropNameID has always taken the named
+// path (putNamedOrIndexed) and setProperty by String the computed path
+// (putComputed_RJS), which raise different messages for some failures (a
+// non-extensible receiver, a proxy trap that returns false), so the
+// exception messages are compared with the matching JS store: PropNameID
+// with PutById, String with PutByVal (with PutById for HermesSandboxRuntime,
+// which has always turned the String into a PropNameID).
+static void checkSetPropertyMatchesJS(
+    Runtime &runtime,
+    bool chainFactoriesOnly) {
+  Runtime *rt = &runtime;
+  auto eval = [rt](const char *code) {
+    return rt->global().getPropertyAsFunction(*rt, "eval").call(*rt, code);
+  };
+  rt->global().setProperty(
+      *rt,
+      "makeHost",
+      Function::createFromHostFunction(
+          *rt,
+          PropNameID::forAscii(*rt, "makeHost"),
+          0,
+          [](Runtime &rt, const Value &, const Value *, size_t) -> Value {
+            return Object::createFromHostObject(
+                rt, std::make_shared<RecordingHostObject>());
+          }));
+  eval(R"(
+    var setterCalls = 0;
+    var swapped = false;
+    var protoWithSetter = { set s(v) { setterCalls++; } };
+    var protoThrowingSetter = {
+      set t(v) { throw new RangeError('setter t got ' + v); }
+    };
+    var protoReadOnly = Object.defineProperty({}, 'ro', {value: 1});
+    var protoGetterOnly =
+        Object.defineProperty({}, 'go', {get() { return 1; }});
+    var protoA = {inherited: 1};
+    // Gets a setter and a read-only property after the caches are warm, and
+    // a new prototype.
+    var protoTop = {};
+    var protoMid = Object.create(protoTop);
+    // Goes into dictionary mode after the caches are warm, then gets a
+    // setter.
+    var protoDel = {x: 1, y: 2};
+    var protoProxy = new Proxy({}, {
+      set(t, k, v, r) {
+        if (k === 'ro') return false;
+        setterCalls++;
+        return Reflect.set(t, k, v, r);
+      }
+    });
+    var factories = [
+      () => ({}),
+      () => ({a: 1}),
+      () => ({a: 1, b: 2, c: 3, d: 4, e: 5}),
+      () => Object.create(protoWithSetter),
+      () => Object.create(protoThrowingSetter),
+      () => Object.create(protoReadOnly),
+      () => Object.create(protoGetterOnly),
+      () => Object.create(protoA),
+      () => Object.create(protoMid),
+      () => Object.create(protoDel),
+      () => Object.create(null),
+      () => Object.defineProperty({a: 1}, 'go', {get() { return 1; }}),
+      () => Object.preventExtensions({}),
+      () => Object.seal({a: 1}),
+      () => Object.freeze({a: 1}),
+      () => { var o = {a: 1, b: 2, c: 3}; delete o.b; return o; },
+      // The same class as ({a: 1}) until it is moved to another prototype.
+      () => {
+        var o = {a: 1};
+        if (swapped) Object.setPrototypeOf(o, protoWithSetter);
+        return o;
+      },
+      () => {
+        var o = {a: 1, b: 2, c: 3};
+        delete o.b;
+        if (swapped) Object.setPrototypeOf(o, protoReadOnly);
+        return o;
+      },
+      () => Object.setPrototypeOf({a: 1}, protoWithSetter),
+      () => [1, 2, 3],
+      () => new Proxy({}, {
+        set(t, k, v) {
+          if (k === 'ro') return false;
+          t[k] = 'trap';
+          return true;
+        }
+      }),
+      () => Object.create(protoProxy),
+      () => makeHost(),
+      () => Object.create(makeHost()),
+    ];
+    // The receivers whose prototype chains change, and one with the same
+    // properties but another prototype.
+    var chainFactories = [0, 1, 7, 8, 9, 16, 17, 18].map(i => factories[i]);
+    var keys = ['a', 'b', 'c', 'f', 'g', 'h', 'i', 's', 't', 'x', 'ro', 'go',
+                'inherited', 'length', 'constructor', 'toString', 'z'];
+    function describe(e) {
+      return e instanceof Error ? e.name + ': ' + e.message
+                                : 'non-Error ' + String(e);
+    }
+    var namedSetters = {};
+    keys.forEach(k => {
+      namedSetters[k] =
+          new Function('o', 'v', '"use strict"; o.' + k + ' = v;');
+    });
+    function jsNamedSet(o, k, v) {
+      'use strict';
+      try { namedSetters[k](o, v); return ''; } catch (e) { return describe(e); }
+    }
+    function jsComputedSet(o, k, v) {
+      'use strict';
+      try { o[k] = v; return ''; } catch (e) { return describe(e); }
+    }
+    function getSetterCalls() { return setterCalls; }
+    function dump(o) {
+      var own = Reflect.ownKeys(o).map(k => {
+        var d = Object.getOwnPropertyDescriptor(o, k);
+        return String(k) + '=' + ('value' in d ? String(d.value) : 'acc') +
+            (d.writable ? 'W' : '') + (d.enumerable ? 'E' : '') +
+            (d.configurable ? 'C' : '');
+      }).join(',');
+      var host = o.__dump;
+      return typeof host === 'string' ? own + ' host:' + host : own;
+    }
+  )");
+  Array factories =
+      rt->global()
+          .getPropertyAsObject(
+              *rt, chainFactoriesOnly ? "chainFactories" : "factories")
+          .asArray(*rt);
+  Array keys = rt->global().getPropertyAsObject(*rt, "keys").asArray(*rt);
+  Function jsNamedSet = rt->global().getPropertyAsFunction(*rt, "jsNamedSet");
+  Function jsComputedSet =
+      rt->global().getPropertyAsFunction(*rt, "jsComputedSet");
+  Function getSetterCalls =
+      rt->global().getPropertyAsFunction(*rt, "getSetterCalls");
+  Function describe = rt->global().getPropertyAsFunction(*rt, "describe");
+  Function dump = rt->global().getPropertyAsFunction(*rt, "dump");
+  auto setterCalls = [&] { return (int)getSetterCalls.call(*rt).getNumber(); };
+
+  enum { ByPropNameID, ByString, ByJSNamed, ByJSComputed, NumWays };
+  static const char *const wayNames[NumWays] = {
+      "PropNameID", "String", "JS o.k = v", "JS o[k] = v"};
+  // HermesSandboxRuntime implements setProperty by String with a PropNameID.
+  const int stringLike =
+      dynamic_cast<HermesSandboxRuntime *>(rt) ? ByJSNamed : ByJSComputed;
+  // How many stores threw, by PropNameID and by String, to check that the
+  // error paths are exercised.
+  int jsiThrows[2] = {0, 0};
+  std::vector<Object> keepAlive;
+  for (int round = 0; round < 14; ++round) {
+    switch (round) {
+      case 3:
+        // A setter on Object.prototype after the add caches are warm.
+        eval(
+            "Object.defineProperty(Object.prototype, 'g', "
+            "{set(v) { setterCalls++; }, configurable: true});");
+        break;
+      case 5:
+        // A setter on a prototype further up the chain.
+        eval(
+            "Object.defineProperty(protoTop, 'h', "
+            "{set(v) { setterCalls++; }, configurable: true});");
+        break;
+      case 6:
+        // Receivers that move to another prototype, and a prototype that
+        // goes into dictionary mode.
+        eval("swapped = true; delete protoDel.y;");
+        break;
+      case 7:
+        // A read-only property on an intermediate prototype.
+        eval(
+            "Object.defineProperty(protoMid, 'i', "
+            "{value: 7, writable: false, configurable: true});");
+        break;
+      case 8:
+        // Object.prototype.g becomes a writable data property, by a flags
+        // update that keeps Object.prototype out of dictionary mode: stores
+        // to g add a shadowing own property again, through the add cache.
+        eval(
+            "Object.defineProperty(Object.prototype, 'g', "
+            "{value: 0, writable: true});");
+        break;
+      case 9:
+        // A setter on the dictionary-mode prototype (which does not change
+        // its class), and a new prototype for an intermediate prototype.
+        eval(
+            "Object.defineProperty(protoDel, 'x', "
+            "{set(v) { setterCalls++; }, configurable: true});"
+            "Object.setPrototypeOf(protoMid, protoWithSetter);");
+        break;
+      case 11:
+        // Object.prototype.g becomes read-only.
+        eval(
+            "Object.defineProperty(Object.prototype, 'g', {writable: false});");
+        break;
+    }
+    for (size_t f = 0; f < factories.size(*rt); ++f) {
+      Function make =
+          factories.getValueAtIndex(*rt, f).getObject(*rt).getFunction(*rt);
+      std::vector<Object> twins;
+      for (int w = 0; w < NumWays; ++w)
+        twins.push_back(make.call(*rt).getObject(*rt));
+      for (size_t k = 0; k < keys.size(*rt); ++k) {
+        Value key = keys.getValueAtIndex(*rt, k);
+        std::string name = key.getString(*rt).utf8(*rt);
+        double v = round * 100 + k;
+        std::string error[NumWays];
+        int calls[NumWays];
+        for (int w = 0; w < NumWays; ++w) {
+          int before = setterCalls();
+          switch (w) {
+            case ByPropNameID:
+            case ByString:
+              try {
+                if (w == ByPropNameID)
+                  twins[w].setProperty(*rt, PropNameID::forUtf8(*rt, name), v);
+                else
+                  twins[w].setProperty(
+                      *rt, String::createFromUtf8(*rt, name), v);
+              } catch (const JSError &e) {
+                error[w] =
+                    describe.call(*rt, e.value()).getString(*rt).utf8(*rt);
+                ++jsiThrows[w];
+              }
+              break;
+            case ByJSNamed:
+              error[w] = jsNamedSet.call(*rt, twins[w], key, v)
+                             .getString(*rt)
+                             .utf8(*rt);
+              break;
+            case ByJSComputed:
+              error[w] = jsComputedSet.call(*rt, twins[w], key, v)
+                             .getString(*rt)
+                             .utf8(*rt);
+              break;
+          }
+          calls[w] = setterCalls() - before;
+        }
+        auto where = [&] {
+          return "round " + std::to_string(round) + " factory " +
+              std::to_string(f) + " key " + name;
+        };
+        EXPECT_EQ(error[ByPropNameID], error[ByJSNamed]) << where();
+        EXPECT_EQ(error[ByString], error[stringLike]) << where();
+        for (int w = 1; w < NumWays; ++w) {
+          EXPECT_EQ(error[0].empty(), error[w].empty())
+              << where() << " " << wayNames[w];
+          EXPECT_EQ(calls[0], calls[w]) << where() << " " << wayNames[w];
+        }
+      }
+      std::string expected = dump.call(*rt, twins[0]).getString(*rt).utf8(*rt);
+      for (int w = 1; w < NumWays; ++w) {
+        EXPECT_EQ(dump.call(*rt, twins[w]).getString(*rt).utf8(*rt), expected)
+            << "round " << round << " factory " << f << " " << wayNames[w];
+      }
+      // Keep the objects, and so their hidden classes and the cache entries
+      // for them, alive across the collection and the next prototype change.
+      for (auto &twin : twins)
+        keepAlive.push_back(std::move(twin));
+    }
+    rt->instrumentation().collectGarbage("SetPropertyCacheMatchesJS");
+  }
+  EXPECT_GT(jsiThrows[ByPropNameID], 0);
+  EXPECT_GT(jsiThrows[ByString], 0);
+}
+
+TEST_P(HermesRuntimeTest, SetPropertyCacheMatchesJS) {
+  checkSetPropertyMatchesJS(*rt, /* chainFactoriesOnly */ false);
+}
+
+// The same with only the receivers whose prototype chains change: few enough
+// (class, name) pairs that the entries made before a change are still in the
+// cache after it, rather than evicted by the other receivers' entries.
+TEST_P(HermesRuntimeTest, SetPropertyCacheInvalidation) {
+  checkSetPropertyMatchesJS(*rt, /* chainFactoriesOnly */ true);
+}
+
+// More (class, name) pairs than the setProperty cache has entries, so that
+// entries keep evicting each other, add entries replacing write entries and
+// the other way around. Every value must land where JS expects it.
+TEST_P(HermesRuntimeTest, SetPropertyCacheEviction) {
+  constexpr int kProtos = 40, kNames = 10;
+  Function check = eval(R"((function(objs, stamp) {
+    for (var c = 0; c < objs.length; c++) {
+      var o = objs[c];
+      var keys = Object.keys(o);
+      if (keys.length !== 10) return 'object ' + c + ' has ' + keys;
+      for (var k = 0; k < 10; k++) {
+        if (keys[k] !== 'p' + k) return 'object ' + c + ' has ' + keys;
+        var want = (stamp * 1000 + c * 10 + k) + 0.5;
+        if (o['p' + k] !== (k % 2 ? want : String(want)))
+          return 'object ' + c + ' p' + k + ' = ' + o['p' + k];
+      }
+    }
+    return 'ok';
+  }))")
+                       .getObject(*rt)
+                       .getFunction(*rt);
+  // Objects with distinct prototypes have distinct hidden classes.
+  Function makeProtos = eval(R"((function(n) {
+    var protos = [];
+    for (var i = 0; i < n; i++) protos.push({['proto' + i]: i});
+    return protos;
+  }))")
+                            .getObject(*rt)
+                            .getFunction(*rt);
+  Array protos = makeProtos.call(*rt, kProtos).getObject(*rt).asArray(*rt);
+  Function create = rt->global()
+                        .getPropertyAsObject(*rt, "Object")
+                        .getPropertyAsFunction(*rt, "create");
+  std::vector<PropNameID> names;
+  for (int k = 0; k < kNames; ++k)
+    names.push_back(PropNameID::forUtf8(*rt, "p" + std::to_string(k)));
+  auto value = [&](int stamp, int c, int k) -> Value {
+    double d = (stamp * 1000 + c * 10 + k) + 0.5;
+    if (k % 2)
+      return Value(d);
+    return String::createFromUtf8(*rt, Value(d).toString(*rt).utf8(*rt));
+  };
+  for (int round = 0; round < 6; ++round) {
+    Array objs(*rt, kProtos);
+    for (int c = 0; c < kProtos; ++c) {
+      Object o =
+          create.call(*rt, protos.getValueAtIndex(*rt, c)).getObject(*rt);
+      // Additions (add entries), then overwrites (write entries), through
+      // both entry points.
+      for (int gen = 0; gen < 2; ++gen) {
+        for (int k = 0; k < kNames; ++k) {
+          Value v = value(round * 2 + gen, c, k);
+          if ((round + gen + k) % 2)
+            o.setProperty(*rt, names[k], v);
+          else
+            o.setProperty(
+                *rt, String::createFromUtf8(*rt, "p" + std::to_string(k)), v);
+        }
+      }
+      objs.setValueAtIndex(*rt, c, o);
+      if (c % 16 == 15)
+        rt->instrumentation().collectGarbage("SetPropertyCacheEviction");
+    }
+    EXPECT_EQ(
+        check.call(*rt, objs, round * 2 + 1).getString(*rt).utf8(*rt), "ok")
+        << "round " << round;
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(
     Runtimes,
     HermesRuntimeTest,

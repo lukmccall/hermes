@@ -61,6 +61,7 @@
 #include "llvh/Support/raw_os_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <list>
@@ -359,6 +360,10 @@ class HermesRuntimeImpl final : public HermesRuntime,
             // the iteration will not destroy the WeakRoot.
             acceptor.acceptWeak(element.valueUnsafe());
           });
+          for (auto &entry : propertyWriteCache_) {
+            acceptor.acceptWeak(entry.clazz);
+            acceptor.acceptWeak(entry.resultClazz);
+          }
         });
 #ifdef HERMES_MEMORY_INSTRUMENTATION
     runtime_.addCustomSnapshotFunction(
@@ -1472,6 +1477,60 @@ class HermesRuntimeImpl final : public HermesRuntime,
 
   /// ExecutionScope for this Runtime.
   MutatorScope mutatorScope;
+
+  /// An inline cache for setProperty, the JSI counterpart of the
+  /// interpreter's PutById caches. An entry for (hidden class, name) is either
+  /// - a write entry (isAdd == false): the slot of an existing own, writable,
+  ///   non-accessor data property without an internal setter, or
+  /// - an add entry: the hidden class transition that adding the property to
+  ///   an object of that class makes, with the slot it lands in. It is used
+  ///   under the same conditions as the interpreter's AddPropertyCacheEntry:
+  ///   the result class is still alive and the runtime's parent cache epoch
+  ///   has not moved (it moves when the class of an object marked with
+  ///   setCachedUsingEpoch changes, e.g. when a setter is defined on a
+  ///   prototype). The full 64-bit epoch is stored: the 24-bit one that
+  ///   interpreter add entries store wraps, and on wrap only those entries are
+  ///   invalidated. Unlike the interpreter, the entry does not record the
+  ///   object's parent: the parent is stored in the hidden class, and the
+  ///   start class of an add entry is never a dictionary (the only kind of
+  ///   class whose parent is updated in place), so a class match implies the
+  ///   parent.
+  /// Classes are held weakly. The class also determines extensibility and
+  /// whether the object is a proxy, host object, lazy or has indexed storage.
+  struct PropertyWriteCacheEntry {
+    vm::WeakRoot<vm::HiddenClass> clazz{nullptr};
+    vm::WeakRoot<vm::HiddenClass> resultClazz{nullptr};
+    vm::SymbolID name{};
+    uint64_t parentEpoch{0};
+    vm::SlotIndex slot{0};
+    bool isAdd{false};
+  };
+  static constexpr unsigned kPropertyWriteCacheBits = 8;
+  static constexpr size_t kPropertyWriteCacheSize = size_t(1)
+      << kPropertyWriteCacheBits;
+  std::array<PropertyWriteCacheEntry, kPropertyWriteCacheSize>
+      propertyWriteCache_{};
+
+  static size_t propertyWriteCacheIndex(
+      vm::CompressedPointer clazz,
+      vm::SymbolID name) {
+    uint64_t h = (uint64_t)clazz.getRaw() * 0x9E3779B97F4A7C15ull ^
+        (uint64_t)name.unsafeGetRaw() * 0xC2B2AE3D27D4EB4Full;
+    // The top bits are the best mixed.
+    return (size_t)(h >> (64 - kPropertyWriteCacheBits));
+  }
+
+  /// setProperty by an interned name, through the cache. \p nameStr is the
+  /// String the name came from, or nullptr if it came from a PropNameID. It
+  /// decides the generic path taken when the store is neither a cache hit nor
+  /// a plain store or addition: putComputed_RJS with the String, as
+  /// setProperty by String always did, or putNamedOrIndexed, as setProperty by
+  /// PropNameID did. That keeps the exceptions and their messages unchanged.
+  void setNamedProperty(
+      const jsi::Object &obj,
+      vm::SymbolID name,
+      const jsi::Value &value,
+      const jsi::String *nameStr);
 };
 
 void HermesRuntimeImpl::maybeScheduleIdleGC() {
@@ -2965,6 +3024,22 @@ void HermesRuntimeImpl::setPropertyValue(
     const jsi::String &name,
     const jsi::Value &value) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  {
+    vm::StringPrimitive *str = phv(name).getString();
+    // Index-like keys keep the computed path (array index semantics).
+    uint32_t len = str->getStringLength();
+    char16_t first = len == 0 ? 0 : str->at(0);
+    if (len != 0 && !(first >= u'0' && first <= u'9')) {
+      // putComputed interns the key first anyway; doing it here lets the
+      // store go through the cache. The handle keeps the symbol alive.
+      vm::GCScope gcScope(runtime_);
+      auto symRes = runtime_.getIdentifierTable().getSymbolHandleFromPrimitive(
+          runtime_, vm::createPseudoHandle(str));
+      checkStatus(symRes.getStatus());
+      setNamedProperty(obj, **symRes, value, &name);
+      return;
+    }
+  }
   vm::GCScope gcScope(runtime_);
   vm::PinnedHermesValue valueStorage;
   auto h = handle(obj);
@@ -2982,10 +3057,168 @@ void HermesRuntimeImpl::setPropertyValue(
     const jsi::PropNameID &name,
     const jsi::Value &value) {
   ExecutionScopeRAII scopeRAII(mutatorScope);
+  setNamedProperty(obj, phv(name).getSymbol(), value, nullptr);
+}
+
+void HermesRuntimeImpl::setNamedProperty(
+    const jsi::Object &obj,
+    vm::SymbolID nameID,
+    const jsi::Value &value,
+    const jsi::String *nameStr) {
+  {
+    vm::CompressedPointer clazzPtr{
+        vm::vmcast<vm::JSObject>(phv(obj))->getClassGCPtr()};
+    PropertyWriteCacheEntry &entry =
+        propertyWriteCache_[propertyWriteCacheIndex(clazzPtr, nameID)];
+    if (LLVM_LIKELY(entry.clazz == clazzPtr && entry.name == nameID)) {
+      // Encode only on a hit: in HV32 builds a double may need boxing, which
+      // allocates. The allocation may run a GC that moves the object and its
+      // class (the entry's weak roots follow) or frees the result class of an
+      // add entry, so the object is read again and the entry is checked
+      // against it after the encode.
+      vm::SmallHermesValue shv =
+          vm::SmallHermesValue::encodeHermesValue(hvFromValue(value), runtime_);
+      auto *self = vm::vmcast<vm::JSObject>(phv(obj));
+      if (LLVM_LIKELY(entry.clazz == self->getClassGCPtr())) {
+        if (!entry.isAdd) {
+          vm::JSObject::setNamedSlotValueUnsafe(
+              self, runtime_, entry.slot, shv);
+          return;
+        }
+        if (LLVM_LIKELY(entry.resultClazz) &&
+            LLVM_LIKELY(
+                entry.parentEpoch == runtime_.getFullParentCacheEpoch())) {
+          vm::HiddenClass *resultClazz =
+              entry.resultClazz.getNonNull(runtime_, runtime_.getHeap());
+          if (LLVM_LIKELY(entry.slot < vm::JSObject::DIRECT_PROPERTY_SLOTS)) {
+            vm::JSObject::addNewOwnPropertyInSlot(
+                self, runtime_, resultClazz, entry.slot, shv);
+            return;
+          }
+          // An indirect slot may need the property storage to grow, which
+          // allocates and needs a GCScope for its handles.
+          vm::GCScope gcScope(runtime_);
+          vm::JSObject::addNewOwnPropertyInSlot(
+              self, runtime_, resultClazz, entry.slot, shv);
+          return;
+        }
+      }
+    }
+  }
   vm::GCScope gcScope(runtime_);
   vm::PinnedHermesValue valueStorage;
   auto h = handle(obj);
-  vm::SymbolID nameID = phv(name).getSymbol();
+  {
+    vm::HiddenClass *clazz = h->getClass(runtime_);
+    bool plainObject = !clazz->hasIndexedStorage() && !clazz->isHostObject() &&
+        !clazz->isProxyObject() && !clazz->isLazyObject();
+    vm::NamedPropertyDescriptor desc;
+    ::hermes::OptValue<bool> own = plainObject
+        ? vm::JSObject::tryGetOwnNamedDescriptorFast(*h, runtime_, nameID, desc)
+        : ::hermes::OptValue<bool>(llvh::None);
+    if (own.hasValue() && own.getValue()) {
+      if (!desc.flags.accessor && desc.flags.writable &&
+          !desc.flags.internalSetter && !desc.flags.hostObject &&
+          !desc.flags.proxyObject) {
+        // An existing plain data property: store it, and cache the slot.
+        vm::SmallHermesValue shv = vm::SmallHermesValue::encodeHermesValue(
+            hvFromValue(value), runtime_);
+        if (!h->getClass(runtime_)->isDictionaryNoCache()) {
+          vm::CompressedPointer clazzPtr{h->getClassGCPtr()};
+          PropertyWriteCacheEntry &entry =
+              propertyWriteCache_[propertyWriteCacheIndex(clazzPtr, nameID)];
+          entry.clazz = clazzPtr;
+          entry.name = nameID;
+          entry.slot = desc.slot;
+          entry.isAdd = false;
+          entry.resultClazz = vm::CompressedPointer(nullptr);
+        }
+        vm::JSObject::setNamedSlotValueUnsafe(*h, runtime_, desc.slot, shv);
+        return;
+      }
+    } else if (own.hasValue() && h->isExtensible(runtime_)) {
+      // Not an own property. It is a plain addition, unless something on the
+      // prototype chain (a setter, a read-only property, a proxy or a host
+      // object) handles the store. This is the lookup that the generic path
+      // starts with.
+      vm::JSObject *propObj =
+          vm::JSObject::getNamedDescriptorUnsafe(h, runtime_, nameID, desc);
+      // [[Set]] also adds an own property when it finds a writable data
+      // property on a prototype, which the new property shadows. (An
+      // internal setter on a prototype applies only to that prototype.)
+      if (!propObj ||
+          (!desc.flags.accessor && desc.flags.writable &&
+           !desc.flags.hostObject && !desc.flags.proxyObject)) {
+        auto startClazz = runtime_.makeHandle(h->getClass(runtime_));
+        checkStatus(vm::JSObject::defineNewOwnProperty(
+            h,
+            runtime_,
+            nameID,
+            vm::PropertyFlags::defaultNewNamedPropertyFlags(),
+            vmHandleFromValue(value, &valueStorage)));
+        auto resultClazz = runtime_.makeHandle(h->getClass(runtime_));
+        // The same conditions as JSObject::tryCacheAddProperty: no dictionary,
+        // proxy or host object on the prototype chain. A non-dictionary result
+        // class means a non-dictionary start class, so the parent is fixed by
+        // the start class.
+        bool cacheable =
+            *resultClazz != *startClazz && !resultClazz->isDictionary();
+        if (cacheable) {
+          for (vm::JSObject *cur = h->getParent(runtime_); cur;
+               cur = cur->getParent(runtime_)) {
+            if (cur->isProxyObject(runtime_) || cur->isHostObject(runtime_) ||
+                cur->getClass(runtime_)->isDictionary()) {
+              // Stop here: getParent() cannot be used on a proxy.
+              cacheable = false;
+              break;
+            }
+          }
+        }
+        // The result class may already exist with its property map lent to a
+        // child class; this lookup rebuilds the map, where the non-allocating
+        // fast lookup would fail every time.
+        vm::NamedPropertyDescriptor added;
+        if (cacheable &&
+            vm::JSObject::getOwnNamedDescriptor(h, runtime_, nameID, added)) {
+          assert(
+              !startClazz->isDictionary() &&
+              "an add entry's start class must not be a dictionary");
+          vm::CompressedPointer startPtr =
+              vm::CompressedPointer::encodeNonNull(*startClazz, runtime_);
+          PropertyWriteCacheEntry &entry =
+              propertyWriteCache_[propertyWriteCacheIndex(startPtr, nameID)];
+          entry.clazz = startPtr;
+          entry.name = nameID;
+          entry.slot = added.slot;
+          entry.isAdd = true;
+          entry.resultClazz =
+              vm::CompressedPointer::encodeNonNull(*resultClazz, runtime_);
+          entry.parentEpoch = runtime_.getFullParentCacheEpoch();
+          // Mark the prototype chain, so that changing it moves the epoch.
+          struct : public vm::Locals {
+            vm::PinnedValue<vm::JSObject> cur;
+          } lv;
+          vm::LocalsRAII lraii{runtime_, &lv};
+          for (lv.cur = h->getParent(runtime_); lv.cur.get() != nullptr;
+               lv.cur = lv.cur->getParent(runtime_)) {
+            vm::JSObject::setCachedUsingEpoch(lv.cur, runtime_);
+          }
+        }
+        return;
+      }
+    }
+  }
+  // The generic path, which also raises the errors.
+  if (nameStr) {
+    checkStatus(h->putComputed_RJS(
+                     h,
+                     runtime_,
+                     stringHandle(*nameStr),
+                     vmHandleFromValue(value, &valueStorage),
+                     vm::PropOpFlags().plusThrowOnError())
+                    .getStatus());
+    return;
+  }
   checkStatus(h->putNamedOrIndexed(
                    h,
                    runtime_,
