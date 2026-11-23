@@ -1265,12 +1265,26 @@ class HermesRuntimeImpl final : public HermesRuntime,
       // dependency, which preserves their ordering on any reasonable hardware.
       // TSAN does not analyse control dependencies, so we use release under
       // TSAN to enforce the ordering of the preceding vtable load.
-
 #if LLVM_THREAD_SANITIZER_BUILD
-      auto oldCount = refCount_.fetch_sub(1, std::memory_order_release);
+      constexpr auto order = std::memory_order_release;
 #else
-      auto oldCount = refCount_.fetch_sub(1, std::memory_order_relaxed);
+      constexpr auto order = std::memory_order_relaxed;
 #endif
+      // If the count is 1, the caller holds the only reference, and the value
+      // can be retired with a plain store instead of a locked
+      // read-modify-write. Nothing can race with the store: inc() needs a live
+      // reference, and the only one is being dropped here; a concurrent dec()
+      // needs a second reference. The load cannot see a stale 1 while a second
+      // reference exists: the inc() that made it happened before that
+      // reference reached any other thread, and this thread then reads at
+      // least that value (if the other reference has since been dropped, the
+      // count really is 1). Most jsi values are never copied, so this is the
+      // common case. The store has the same ordering as the fetch_sub below.
+      if (LLVM_LIKELY(refCount_.load(std::memory_order_relaxed) == 1)) {
+        refCount_.store(0, order);
+        return;
+      }
+      auto oldCount = refCount_.fetch_sub(1, order);
       assert(oldCount > 0 && "Ref count underflow");
       (void)oldCount;
     }

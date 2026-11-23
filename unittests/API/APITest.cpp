@@ -20,6 +20,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -4612,6 +4614,77 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
           caughtObj, rt->global().getPropertyAsFunction(*rt, "URIError")));
     }
   }
+}
+
+// Pointer values released on another thread while the runtime thread creates,
+// copies and releases its own, some sole-owned (count 1 -> 0 through the
+// store fast path) and some shared (count 2, one reference dropped on each
+// thread). Every value must be released exactly once: after a collection the
+// roots list must be back to its starting length. Run under TSAN, this also
+// checks the release path for races.
+TEST(HermesRuntimeRefCountTest, ConcurrentReleaseFromAnotherThread) {
+  auto rt = makeHermesRuntime();
+  auto *helpers = castInterface<IHermesTestHelpers>(rt.get());
+  ASSERT_NE(helpers, nullptr);
+  rt->instrumentation().collectGarbage("baseline");
+  size_t baseline = HermesTestHelper::rootsListLength(*helpers);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::vector<Value>> queue;
+  bool done = false;
+  std::thread releaser([&]() {
+    for (;;) {
+      std::vector<Value> batch;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&]() { return done || !queue.empty(); });
+        if (queue.empty())
+          return;
+        batch = std::move(queue.front());
+        queue.pop_front();
+      }
+      batch.clear();
+    }
+  });
+
+  for (int round = 0; round < 200; ++round) {
+    std::vector<Value> mine, theirs;
+    for (int i = 0; i < 50; ++i) {
+      Object o(*rt);
+      if (i % 2) {
+        theirs.emplace_back(*rt, o);
+        mine.emplace_back(std::move(o));
+      } else {
+        theirs.emplace_back(std::move(o));
+      }
+      theirs.emplace_back(String::createFromAscii(*rt, "s"));
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      queue.push_back(std::move(theirs));
+    }
+    cv.notify_one();
+    // Races with the releaser dropping the other references: copy (inc) and
+    // drop (dec) the shared values here while it drops its references to
+    // the same values.
+    for (int k = 0; k < 3; ++k) {
+      std::vector<Value> copies;
+      for (auto &v : mine)
+        copies.emplace_back(*rt, v);
+    }
+    mine.clear();
+    if (round % 20 == 0)
+      rt->instrumentation().collectGarbage("ConcurrentRelease");
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    done = true;
+  }
+  cv.notify_one();
+  releaser.join();
+  rt->instrumentation().collectGarbage("final");
+  EXPECT_EQ(HermesTestHelper::rootsListLength(*helpers), baseline);
 }
 
 INSTANTIATE_TEST_CASE_P(
