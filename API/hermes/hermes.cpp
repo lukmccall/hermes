@@ -729,7 +729,11 @@ class HermesRuntimeImpl final : public HermesRuntime,
     }
   }
 
-  jsi::Value valueFromHermesValue(vm::HermesValue hv) {
+  /// Converts \p hv to a jsi::Value. Forced inline: it is on almost every
+  /// path that returns a value through JSI, and GCC (13, Release) otherwise
+  /// keeps it out of line and calls it from every caller.
+  LLVM_ATTRIBUTE_ALWAYS_INLINE jsi::Value valueFromHermesValue(
+      vm::HermesValue hv) {
     if (hv.isUndefined() || hv.isEmpty()) {
       return jsi::Value::undefined();
     } else if (hv.isNull()) {
