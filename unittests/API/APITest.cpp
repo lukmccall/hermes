@@ -1243,6 +1243,221 @@ TEST_P(HermesRuntimeTest, HostObjectAsParentTest) {
       eval("var subClass = {__proto__: ho}; subClass.prop1 == 10;").getBool());
 }
 
+// GetById/PutById call getters and setters directly, and cache those on the
+// immediate prototype. Host objects must still take the generic path, as
+// receivers and as prototypes, and accessors backed by host functions must be
+// called like any other. Accesses by name are compared with the same accesses
+// by a computed key, which never use that cache.
+TEST_P(HermesRuntimeTest, AccessorsWithHostObjectsAndHostFunctions) {
+  std::vector<std::string> log;
+  class RecordingHostObject : public HostObject {
+   public:
+    explicit RecordingHostObject(std::vector<std::string> &log) : log_(log) {}
+    Value get(Runtime &rt, const PropNameID &name) override {
+      log_.push_back("get " + name.utf8(rt));
+      return String::createFromUtf8(rt, "host " + name.utf8(rt));
+    }
+    void set(Runtime &rt, const PropNameID &name, const Value &value) override {
+      log_.push_back(
+          "set " + name.utf8(rt) + "=" + value.toString(rt).utf8(rt));
+    }
+
+   private:
+    std::vector<std::string> &log_;
+  };
+  for (const char *name : {"ho", "hoWithAccessorProto"}) {
+    rt->global().setProperty(
+        *rt,
+        name,
+        Object::createFromHostObject(
+            *rt, std::make_shared<RecordingHostObject>(log)));
+  }
+
+  // Host functions used as getter and setter record their receiver.
+  auto recordThis = [&log](
+                        const char *what,
+                        Runtime &rt,
+                        const Value &thisVal,
+                        const Value *args,
+                        size_t count) {
+    std::string entry = std::string(what) + " this.x=" +
+        thisVal.asObject(rt).getProperty(rt, "x").toString(rt).utf8(rt);
+    if (count)
+      entry += " v=" + args[0].toString(rt).utf8(rt);
+    log.push_back(entry);
+  };
+  rt->global().setProperty(
+      *rt,
+      "hostGet",
+      Function::createFromHostFunction(
+          *rt,
+          PropNameID::forAscii(*rt, "hostGet"),
+          0,
+          [recordThis](
+              Runtime &rt,
+              const Value &thisVal,
+              const Value *args,
+              size_t count) -> Value {
+            recordThis("hostGet", rt, thisVal, args, count);
+            return thisVal.asObject(rt).getProperty(rt, "x");
+          }));
+  rt->global().setProperty(
+      *rt,
+      "hostSet",
+      Function::createFromHostFunction(
+          *rt,
+          PropNameID::forAscii(*rt, "hostSet"),
+          1,
+          [recordThis](
+              Runtime &rt,
+              const Value &thisVal,
+              const Value *args,
+              size_t count) -> Value {
+            recordThis("hostSet", rt, thisVal, args, count);
+            return Value::undefined();
+          }));
+  rt->global().setProperty(
+      *rt,
+      "hostThrow",
+      Function::createFromHostFunction(
+          *rt,
+          PropNameID::forAscii(*rt, "hostThrow"),
+          1,
+          [](Runtime &rt, const Value &, const Value *, size_t) -> Value {
+            throw JSError(rt, "host boom");
+          }));
+
+  eval(R"(
+    var KEY = Object.keys({prop: 0})[0];
+    var AKEY = Object.keys({acc: 0})[0];
+    function threw(e) { return 'threw ' + e.message; }
+    function rd(o) { try { return o.prop; } catch (e) { return threw(e); } }
+    function rdC(o) { try { return o[KEY]; } catch (e) { return threw(e); } }
+    function wr(o, v) {
+      'use strict';
+      try { o.prop = v; return 'ok'; } catch (e) { return threw(e); }
+    }
+    function wrC(o, v) {
+      'use strict';
+      try { o[KEY] = v; return 'ok'; } catch (e) { return threw(e); }
+    }
+    function rdA(o) { return o.acc; }
+    function rdAC(o) { return o[AKEY]; }
+    function wrA(o, v) { o.acc = v; }
+    function wrAC(o, v) { o[AKEY] = v; }
+
+    // A host object with an own JS accessor, and objects inheriting from it.
+    Object.defineProperty(ho, 'acc', {get() { return 'acc ' + this.x; },
+        set(v) { this.last = v; }, configurable: true});
+    function hostChain() {
+      var sub = Object.create(ho); sub.x = 'sub';
+      var subsub = Object.create(sub); subsub.x = 'subsub';
+      return [ho, sub, subsub, hoWithAccessorProto];
+    }
+    // A host object whose prototype has an accessor of the same name, read
+    // after a plain object with the same prototype.
+    var accessorProto = Object.defineProperty({}, 'prop',
+        {get() { return 'proto getter'; }, set(v) {}, configurable: true});
+    Object.setPrototypeOf(hoWithAccessorProto, accessorProto);
+    function hostWithAccessorProto() {
+      return [Object.create(accessorProto), hoWithAccessorProto];
+    }
+
+    // Host functions as accessors, on a prototype and as own properties.
+    function Cls(x) { this.x = x; }
+    Object.defineProperty(Cls.prototype, 'prop',
+        {get: hostGet, set: hostSet, configurable: true});
+    function hostFnObjs() {
+      var mod = {x: 'mod'};
+      Object.defineProperty(mod, 'prop', {get: hostGet, set: hostSet});
+      var thrower = {x: 'thrower'};
+      Object.defineProperty(thrower, 'prop', {get: hostThrow, set: hostThrow});
+      return [new Cls(1), new Cls(2), mod, thrower];
+    }
+
+    // Reads and writes, by name or by computed key, on new objects.
+    function run(mkObjs, read, write, rounds) {
+      var objs = mkObjs();
+      var out = [];
+      for (var i = 0; i < rounds; i++) {
+        for (var j = 0; j < objs.length; j++) {
+          out.push(read(objs[j]));
+          out.push(write(objs[j], i));
+        }
+      }
+      return out.join('|');
+    }
+  )");
+
+  auto run = [&](const char *code) {
+    log.clear();
+    std::string result = eval(code).getString(*rt).utf8(*rt);
+    for (auto &entry : log)
+      result += "\n" + entry;
+    return result;
+  };
+
+  // Host objects as receivers and prototypes.
+  std::string byName = run("run(hostChain, rd, wr, 10)");
+  EXPECT_EQ(byName, run("run(hostChain, rdC, wrC, 10)"));
+  // Writes through the host object create own properties on its children.
+  EXPECT_EQ(
+      byName.rfind(
+          "host prop|ok|host prop|ok|0|ok|host prop|ok|"
+          "host prop|ok|0|ok|0|ok|host prop|ok|",
+          0),
+      0);
+  EXPECT_NE(
+      byName.find("\nget prop\nset prop=0\nget prop\nget prop\n"),
+      std::string::npos);
+  EXPECT_NE(byName.find("\nset prop=9"), std::string::npos);
+  byName = run("run(hostWithAccessorProto, rd, wr, 10)");
+  EXPECT_EQ(byName, run("run(hostWithAccessorProto, rdC, wrC, 10)"));
+  EXPECT_EQ(
+      byName.rfind(
+          "proto getter|ok|host prop|ok|proto getter|ok|host prop|ok|", 0),
+      0);
+  // A JS accessor defined on the host object itself. Reading it by name
+  // through a child asks the host object (unlike a computed read, which sees
+  // the JS property), so compare with the generic path's results directly.
+  std::string expected =
+      "acc host x|host last|host acc|host last|0|host last|host acc|host last";
+  for (int i = 1; i < 10; ++i) {
+    expected += "|acc host x|host last|" + std::to_string(i - 1) +
+        "|host last|" + std::to_string(i - 1) + "|host last|host acc|host last";
+  }
+  std::string acc =
+      run("run(hostChain, rdA, (o, v) => { wrA(o, v); return o.last; }, 10)");
+  EXPECT_EQ(acc.substr(0, acc.find('\n')), expected);
+  EXPECT_NE(
+      acc.find("\nget x\nset last=0\nget last\nget acc\nget last\nget last\n"),
+      std::string::npos);
+
+  // Accessors backed by host functions.
+  byName = run("run(hostFnObjs, rd, wr, 10)");
+  EXPECT_EQ(byName, run("run(hostFnObjs, rdC, wrC, 10)"));
+  EXPECT_NE(
+      byName.find("1|ok|2|ok|mod|ok|threw host boom|threw host boom"),
+      std::string::npos);
+  EXPECT_NE(byName.find("hostGet this.x=2"), std::string::npos);
+  EXPECT_NE(byName.find("hostSet this.x=mod v=9"), std::string::npos);
+
+  // Redefine the prototype accessor to a throwing host function, then to a
+  // JS one, after the cache is warm.
+  eval(R"(Object.defineProperty(Cls.prototype, 'prop',
+      {get: hostThrow, set: hostThrow, configurable: true});)");
+  byName = run("run(hostFnObjs, rd, wr, 3)");
+  EXPECT_EQ(byName, run("run(hostFnObjs, rdC, wrC, 3)"));
+  EXPECT_NE(
+      byName.find("threw host boom|threw host boom|threw host boom"),
+      std::string::npos);
+  eval(R"(Object.defineProperty(Cls.prototype, 'prop',
+      {get() { return 'js ' + this.x; }, configurable: true});)");
+  byName = run("run(hostFnObjs, rd, wr, 3)");
+  EXPECT_EQ(byName, run("run(hostFnObjs, rdC, wrC, 3)"));
+  EXPECT_NE(byName.find("js 1|threw "), std::string::npos);
+}
+
 TEST_P(HermesRuntimeTest, NativeStateTest) {
   class C : public facebook::jsi::NativeState {
    public:

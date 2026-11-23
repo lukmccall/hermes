@@ -47,6 +47,7 @@
 #include "llvh/ADT/DenseMap.h"
 #include "llvh/ADT/SmallVector.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -1432,6 +1433,50 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Caches for property lookups in non-JS code.
   WritePropertyCacheEntry fixedWritePropCache_[(size_t)PropCacheID::_COUNT];
   ReadPropertyCacheEntry fixedReadPropCache_[(size_t)PropCacheID::_COUNT];
+
+ public:
+  /// GetById's and PutById's inline caches only hold data properties, so
+  /// every access to an accessor property (a getter or setter) takes the slow
+  /// path, which looks the property up again along the prototype chain before
+  /// calling the accessor. The slow path's own lookup finds own accessors; for
+  /// the common other case, an accessor on the immediate prototype (which is
+  /// how classes expose getters and setters), the interpreter's slow paths
+  /// consult this side cache once the own lookup has found nothing. It maps
+  /// (prototype's hidden class, name) to the slot holding the
+  /// PropertyAccessor. Getters and setters use separate tables. Entries are
+  /// filled by the generic by-name lookup (getNamedWithReceiver_RJS,
+  /// putNamedWithReceiver_RJS) when a caching access site finds an accessor
+  /// on the immediate prototype, so a miss costs the slow path one probe.
+  ///
+  /// As in the inline caches, classes are held weakly, classes in uncacheable
+  /// dictionary mode are never cached, and the slot is read on every hit, so
+  /// an accessor redefined in place is seen.
+  struct AccessorCacheEntry {
+    /// The class of the prototype that holds the accessor.
+    WeakRoot<HiddenClass> clazz{nullptr};
+    /// Not a GC root. A hit needs an object whose class is \c clazz, and that
+    /// class defines \c name, which keeps the symbol alive: a non-dictionary
+    /// class through its property map or its chain of parent classes, a
+    /// dictionary class through its property map, which it only gives up when
+    /// its object moves to a new class (after which no object has the old
+    /// class). When \c clazz dies, the full collection that may free the
+    /// symbol also clears it, and a null \c clazz never matches.
+    SymbolID name{};
+    SlotIndex slot{0};
+  };
+  static constexpr unsigned kAccessorCacheBits = 7;
+  static constexpr size_t kAccessorCacheSize = size_t(1) << kAccessorCacheBits;
+  AccessorCacheEntry &
+  accessorCacheEntry(CompressedPointer clazz, SymbolID name, bool forSet) {
+    uint64_t h = (uint64_t)clazz.getRaw() * 0x9E3779B97F4A7C15ull ^
+        (uint64_t)name.unsafeGetRaw() * 0xC2B2AE3D27D4EB4Full;
+    size_t i = (size_t)(h >> (64 - kAccessorCacheBits));
+    return forSet ? accessorSetCache_[i] : accessorGetCache_[i];
+  }
+
+ private:
+  std::array<AccessorCacheEntry, kAccessorCacheSize> accessorGetCache_{};
+  std::array<AccessorCacheEntry, kAccessorCacheSize> accessorSetCache_{};
 
   /// StringPrimitive representation of the first 256 characters.
   /// These are allocated as "long-lived" objects, so they don't need

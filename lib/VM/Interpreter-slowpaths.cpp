@@ -1449,6 +1449,35 @@ ExecutionStatus doCallRequireSlowPath_RJS(
   return ExecutionStatus::RETURNED;
 }
 
+/// \return the accessor property \p name on the immediate prototype of
+/// \p obj, whose class \p clazzPtr has no own property \p name (the own
+/// lookup just found none), if the runtime's accessor cache (its setter table
+/// if \p forSet) knows it; otherwise null, and the caller takes the generic
+/// path, which fills the cache when it finds an accessor there.
+static PropertyAccessor *getCachedProtoAccessor(
+    Runtime &runtime,
+    JSObject *obj,
+    CompressedPointer clazzPtr,
+    SymbolID name,
+    bool forSet) {
+  // The own lookup does not see the properties of host objects and proxies,
+  // nor those of lazy objects before they are initialized.
+  auto *clazz = vmcast<HiddenClass>(clazzPtr.getNonNull(runtime));
+  if (clazz->isHostObject() || clazz->isProxyObject() || clazz->isLazyObject())
+    return nullptr;
+  JSObject *parent = obj->getParent(runtime);
+  if (!parent)
+    return nullptr;
+  CompressedPointer parentClazzPtr = parent->getClassGCPtr();
+  const Runtime::AccessorCacheEntry &entry =
+      runtime.accessorCacheEntry(parentClazzPtr, name, forSet);
+  if (!(entry.clazz == parentClazzPtr) || entry.name != name)
+    return nullptr;
+  return vmcast<PropertyAccessor>(
+      JSObject::getNamedSlotValueUnsafe(parent, runtime, entry.slot)
+          .getPointer(runtime));
+}
+
 ExecutionStatus doGetByIdSlowPath_RJS(
     Runtime &runtime,
     PinnedHermesValue *frameRegs,
@@ -1508,6 +1537,32 @@ ExecutionStatus doGetByIdSlowPath_RJS(
     O1REG(GetById) = JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
                          .unboxToHV(runtime);
     return ExecutionStatus::RETURNED;
+  }
+
+  // A getter, own (found above) or on the immediate prototype (known from the
+  // accessor cache): call it without looking the property up again.
+  if (LLVM_LIKELY(fastPathResult.hasValue())) {
+    PropertyAccessor *accessor = fastPathResult.getValue()
+        ? vmcast<PropertyAccessor>(
+              JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
+                  .getPointer(runtime))
+        : getCachedProtoAccessor(runtime, obj, clazzPtr, id, /*forSet*/ false);
+    if (accessor) {
+      ++NumGetByIdAccessor;
+      ++NumGetByIdSlow;
+      if (!accessor->getter) {
+        O1REG(GetById) = HermesValue::encodeUndefinedValue();
+        return ExecutionStatus::RETURNED;
+      }
+      auto res = Callable::executeCall0(
+          runtime.makeHandle(accessor->getter),
+          runtime,
+          Handle<>(&O2REG(GetById)));
+      if (LLVM_UNLIKELY(res == ExecutionStatus::EXCEPTION))
+        return ExecutionStatus::EXCEPTION;
+      O1REG(GetById) = res->get();
+      return ExecutionStatus::RETURNED;
+    }
   }
 
 #ifdef HERMES_SLOW_DEBUG
@@ -1837,6 +1892,33 @@ ExecutionStatus Interpreter::putByIdSlowPath_RJS(
     JSObject::setNamedSlotValueUnsafe(obj, runtime, desc.slot, shv);
     return ExecutionStatus::RETURNED;
   }
+
+  // A setter, own (found above) or on the immediate prototype (known from the
+  // accessor cache): call it without looking the property up again.
+  // Accessors without a setter take the generic path below, which knows how
+  // to fail in strict and sloppy mode.
+  if (LLVM_LIKELY(hasOwnProp.hasValue())) {
+    PropertyAccessor *accessor = nullptr;
+    if (!hasOwnProp.getValue()) {
+      accessor =
+          getCachedProtoAccessor(runtime, obj, clazzPtr, id, /*forSet*/ true);
+    } else if (desc.flags.accessor) {
+      accessor = vmcast<PropertyAccessor>(
+          JSObject::getNamedSlotValueUnsafe(obj, runtime, desc)
+              .getPointer(runtime));
+    }
+    if (accessor && accessor->setter) {
+      if (accessor->setter.getNonNull(runtime)->executeCall1(
+              runtime.makeHandle(accessor->setter),
+              runtime,
+              Handle<>(base),
+              *value) == ExecutionStatus::EXCEPTION) {
+        return ExecutionStatus::EXCEPTION;
+      }
+      return ExecutionStatus::RETURNED;
+    }
+  }
+
   const PropOpFlags defaultPropOpFlags = DEFAULT_PROP_OP_FLAGS(strictMode);
   auto putRes = JSObject::putNamed_RJS(
       Handle<JSObject>::vmcast(base),

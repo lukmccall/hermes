@@ -1171,6 +1171,30 @@ ExecutionStatus JSObject::getComputedDescriptor(
       selfHandle, runtime, *converted, propObj, desc);
 }
 
+/// Record in the runtime's accessor cache (its setter table if \p forSet)
+/// that every object of \p holder's class has an accessor property \p name
+/// in slot \p slot, so that the interpreter's GetById/PutById slow paths can
+/// call it without a lookup for objects whose immediate prototype has that
+/// class. See Runtime::AccessorCacheEntry.
+static void cacheProtoAccessor(
+    Runtime &runtime,
+    JSObject *holder,
+    SymbolID name,
+    SlotIndex slot,
+    bool forSet) {
+  // Uncacheable dictionaries change their properties without changing class.
+  HiddenClass *clazz = holder->getClass(runtime);
+  if (clazz->isDictionaryNoCache() || clazz->isHostObject() ||
+      clazz->isProxyObject() || clazz->isLazyObject())
+    return;
+  CompressedPointer clazzPtr = holder->getClassGCPtr();
+  Runtime::AccessorCacheEntry &entry =
+      runtime.accessorCacheEntry(clazzPtr, name, forSet);
+  entry.clazz = clazzPtr;
+  entry.name = name;
+  entry.slot = slot;
+}
+
 CallResult<PseudoHandle<>> JSObject::getNamedWithReceiver_RJS(
     Handle<JSObject> selfHandle,
     Runtime &runtime,
@@ -1234,6 +1258,10 @@ CallResult<PseudoHandle<>> JSObject::getNamedWithReceiver_RJS(
   if (desc.flags.accessor) {
     auto *accessor = vmcast<PropertyAccessor>(
         getNamedSlotValueUnsafe(propObj, runtime, desc).getPointer(runtime));
+    // A by-name access site (one that caches): if the accessor is on the
+    // immediate prototype, let the interpreter's slow path find it directly.
+    if (cacheEntry && propObj == selfHandle->getParent(runtime))
+      cacheProtoAccessor(runtime, propObj, name, desc.slot, /*forSet*/ false);
     if (!accessor->getter)
       return createPseudoHandle(HermesValue::encodeUndefinedValue());
 
@@ -1531,6 +1559,11 @@ CallResult<bool> JSObject::putNamedWithReceiver_RJS(
         }
         return false;
       }
+
+      // A by-name access site (one that caches): if the setter is on the
+      // immediate prototype, let the interpreter's slow path find it directly.
+      if (cacheEntry && propObj == selfHandle->getParent(runtime))
+        cacheProtoAccessor(runtime, propObj, name, desc.slot, /*forSet*/ true);
 
       // Execute the accessor on this object.
       if (accessor->setter.getNonNull(runtime)->executeCall1(

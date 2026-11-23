@@ -778,6 +778,12 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
   // dead from runtimeModuleList_, before marking long-lived WeakRoots in them.
   markDomainRefInRuntimeModules(acceptor);
   if (markLongLived) {
+    // Hidden classes are long-lived, so only full collections can free them.
+    for (auto *cache : {&accessorGetCache_, &accessorSetCache_}) {
+      for (auto &entry : *cache) {
+        acceptor.acceptWeak(entry.clazz);
+      }
+    }
     for (auto &entry : fixedWritePropCache_) {
       acceptor.acceptWeak(entry.clazz);
     }
