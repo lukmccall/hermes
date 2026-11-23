@@ -1168,7 +1168,7 @@ class HermesRuntimeImpl final : public HermesRuntime,
     /// finalize the NativeState object.
     static void finalize(vm::GC &, vm::NativeState *ns) {
       auto *context = reinterpret_cast<NativeStateContext *>(ns->context());
-      context->runtime.finalizerExecutor_.add([context]() { delete context; });
+      context->runtime.queueNativeStateDelete(context);
     }
   };
 
@@ -1413,12 +1413,60 @@ class HermesRuntimeImpl final : public HermesRuntime,
       UUIDInfo>
       dataMap_;
 
+  /// NativeState contexts finalized by the GC and not yet deleted. The first
+  /// context added to an empty list posts one drain task to
+  /// finalizerExecutor_, which deletes every context queued by the time it
+  /// runs; the ones that follow only append. Finalizers can run on the GC's
+  /// background thread, hence the lock; no user code runs while it is held.
+  /// NativeState destruction is therefore not FIFO with the HostObject and
+  /// HostFunction clean-ups posted to the same executor (no order between
+  /// them was ever guaranteed).
+  /// Declared before finalizerExecutor_ so that both outlive the drain tasks
+  /// the executor runs when it is destroyed.
+  std::mutex pendingNativeStatesMutex_;
+  std::vector<NativeStateContext *> pendingNativeStates_;
+
   /// Executor used to finalize NativeState, HostFunction, and HostObjects on
   /// a background thread so that GC collection is not blocked by potentially
   /// expensive clean-up work. The destructor explicitly calls rt_.reset()
   /// before this member is destroyed to ensure all clean-up tasks are queued
   /// before the executor drains and joins.
   ::hermes::SerialExecutor finalizerExecutor_;
+
+  /// Queue \p context to be deleted on finalizerExecutor_. Every queued
+  /// context is deleted without waiting for any further GC activity.
+  void queueNativeStateDelete(NativeStateContext *context) {
+    {
+      std::lock_guard<std::mutex> lock(pendingNativeStatesMutex_);
+      pendingNativeStates_.push_back(context);
+      // A drain is already posted and has not taken the list yet.
+      if (pendingNativeStates_.size() != 1)
+        return;
+    }
+    finalizerExecutor_.add([this]() { drainNativeStateDeletes(); });
+  }
+
+  /// Runs on finalizerExecutor_.
+  void drainNativeStateDeletes() {
+    std::vector<NativeStateContext *> batch;
+    {
+      std::lock_guard<std::mutex> lock(pendingNativeStatesMutex_);
+      batch.swap(pendingNativeStates_);
+    }
+    for (auto *context : batch)
+      delete context;
+    // Give the storage back, so that the next batch does not regrow it, unless
+    // it is large: an unusually big collection should not pin its storage
+    // for the runtime's lifetime.
+    constexpr size_t kMaxRetainedCapacity = 4096;
+    if (batch.capacity() > kMaxRetainedCapacity)
+      return;
+    batch.clear();
+    std::lock_guard<std::mutex> lock(pendingNativeStatesMutex_);
+    if (pendingNativeStates_.empty() &&
+        pendingNativeStates_.capacity() < batch.capacity())
+      pendingNativeStates_.swap(batch);
+  }
 
   /// Provided by the integrator for the Runtime to schedule a task. This is
   /// called whenever the Hermes Runtime wants to run a task, but should not

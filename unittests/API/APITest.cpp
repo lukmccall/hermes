@@ -4614,6 +4614,46 @@ TEST_P(HermesRuntimeTest, CreateErrorTest) {
   }
 }
 
+// NativeState destructors run on the finalizer thread, now handed over in
+// batches. Every one must still run: after a collection, whatever the number
+// of objects, and when the runtime is destroyed.
+TEST(HermesRuntimeNativeStateTest, AllNativeStatesAreDestroyed) {
+  static std::atomic<int> destroyed{0};
+  struct Counted : NativeState {
+    ~Counted() override {
+      destroyed++;
+    }
+  };
+  auto waitFor = [](int want) {
+    for (int i = 0; i < 1000 && destroyed.load() < want; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return destroyed.load();
+  };
+  destroyed = 0;
+  int expected = 0;
+  {
+    auto rt = makeHermesRuntime();
+    for (int batch : {1, 3, 10, 100, 1000}) {
+      for (int i = 0; i < batch; ++i) {
+        Object o(*rt);
+        o.setNativeState(*rt, std::make_shared<Counted>());
+      }
+      expected += batch;
+      rt->instrumentation().collectGarbage("AllNativeStatesAreDestroyed");
+      EXPECT_EQ(waitFor(expected), expected) << "batch " << batch;
+    }
+    // Unreachable but not yet collected when the runtime goes away.
+    for (int i = 0; i < 100; ++i) {
+      Object o(*rt);
+      o.setNativeState(*rt, std::make_shared<Counted>());
+    }
+    expected += 100;
+  }
+  // ~HermesRuntimeImpl joins the finalizer thread, so every destructor has
+  // run by now.
+  EXPECT_EQ(destroyed.load(), expected);
+}
+
 INSTANTIATE_TEST_CASE_P(
     Runtimes,
     HermesRuntimeTest,
