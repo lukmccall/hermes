@@ -8,6 +8,19 @@
 #define DEBUG_TYPE "gc"
 #include "hermes/VM/GC.h"
 
+#if defined(__APPLE__) || defined(__ANDROID__) || defined(__FreeBSD__) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
+#include <stdlib.h> // arc4random_buf
+#elif defined(__linux__)
+#include <unistd.h>
+// getentropy is in glibc since 2.25. Elsewhere, std::random_device is used.
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 25)
+#define HERMES_GCBASE_HAVE_GETENTROPY 1
+#endif
+#endif
+#endif
+
 #include "hermes/Platform/Logging.h"
 #include "hermes/Public/JSOutOfMemoryError.h"
 #include "hermes/Support/ErrorHandling.h"
@@ -63,12 +76,28 @@ GCBase::GCBase(
 #endif
       tripwireCallback_(gcConfig.getTripwireConfig().getCallback()),
       tripwireLimit_(gcConfig.getTripwireConfig().getLimit()) {
-  for (unsigned i = 0; i < (unsigned)XorPtrKeyID::_NumKeys; ++i) {
-    pointerEncryptionKey_[i] = std::random_device()();
-    if constexpr (sizeof(uintptr_t) >= 8) {
-      // std::random_device() yields an unsigned int, so combine two.
-      pointerEncryptionKey_[i] =
-          (pointerEncryptionKey_[i] << 32) | std::random_device()();
+  // Fill every key with one call into the OS CSPRNG where there is one. Each
+  // std::random_device() is a separate entropy read per 32 bits (with
+  // libstdc++ on x86 that is RDSEED, which can take tens of microseconds),
+  // and the loop below makes two per key.
+  bool keysFilled = false;
+#if defined(__APPLE__) || defined(__ANDROID__) || defined(__FreeBSD__) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
+  arc4random_buf(pointerEncryptionKey_, sizeof(pointerEncryptionKey_));
+  keysFilled = true;
+#elif defined(HERMES_GCBASE_HAVE_GETENTROPY)
+  static_assert(sizeof(pointerEncryptionKey_) <= 256, "getentropy limit");
+  keysFilled =
+      getentropy(pointerEncryptionKey_, sizeof(pointerEncryptionKey_)) == 0;
+#endif
+  if (!keysFilled) {
+    std::random_device rd;
+    for (unsigned i = 0; i < (unsigned)XorPtrKeyID::_NumKeys; ++i) {
+      pointerEncryptionKey_[i] = rd();
+      if constexpr (sizeof(uintptr_t) >= 8) {
+        // std::random_device yields an unsigned int, so combine two.
+        pointerEncryptionKey_[i] = (pointerEncryptionKey_[i] << 32) | rd();
+      }
     }
   }
   buildMetadataTable();
